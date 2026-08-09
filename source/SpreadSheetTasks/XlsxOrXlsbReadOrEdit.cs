@@ -981,7 +981,7 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
         }
         else
         {
-            _sheetStream = new BufferedStream(_sheetEntry.Open());
+            _sheetStream = new BufferedStream(_sheetEntry.Open(), 65_536);
             _biffReader = new BiffReaderWriter(_sheetStream);
         }
 
