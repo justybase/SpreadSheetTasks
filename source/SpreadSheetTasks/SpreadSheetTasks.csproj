@@ -10,11 +10,11 @@
     <Description>The .NET library for fast reading and writing Excel files (.xlsx, .xlsb)</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
 	<PackageReadmeFile>README.md</PackageReadmeFile>
-    <AssemblyVersion>1.0.0.0</AssemblyVersion>
-    <FileVersion>1.0.0.0</FileVersion>
-	 <Version>1.0.0</Version>
+    <AssemblyVersion>1.0.1.0</AssemblyVersion>
+    <FileVersion>1.0.1.0</FileVersion>
+	 <Version>1.0.1</Version>
 	<LangVersion>latest</LangVersion>
-    <PackageReleaseNotes>Performance improvements, Csv writer preview</PackageReleaseNotes>
+    <PackageReleaseNotes>XLSB read performance improvements (span-based record parsing, 64 KiB buffered streaming), stress tests</PackageReleaseNotes>
     <PackageTags>xlsx;xlsb;excel;spreadsheets</PackageTags>
     <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
     <RepositoryUrl>https://github.com/KrzysztofDusko/SpreadSheetTasks</RepositoryUrl>
