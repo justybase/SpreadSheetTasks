@@ -1,267 +1,141 @@
 # SpreadSheetTasks
 
-The .NET library for fast reading and writing Excel files (.xlsx, .xlsb).
+[![CI](https://github.com/KrzysztofDusko/SpreadSheetTasks/actions/workflows/ci.yml/badge.svg)](https://github.com/KrzysztofDusko/SpreadSheetTasks/actions/workflows/ci.yml)
+[![NuGet](https://img.shields.io/nuget/v/SpreadSheetTasks.svg)](https://www.nuget.org/packages/SpreadSheetTasks/)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
+Fast, allocation-conscious .NET support for reading and writing Excel workbooks in
+`.xlsx` and `.xlsb` formats.
+
+SpreadSheetTasks is designed for data pipelines, backend services, command-line
+tools and applications that need predictable streaming access to Excel data
+without requiring Microsoft Excel.
+
+## Highlights
+
+- Read and write both XLSX and XLSB files.
+- Stream rows with typed getters such as `GetString`, `GetInt32`, `GetDouble`
+  and `GetDateTime`.
+- Write from `DataTable`, `IDataReader`, object arrays or typed row lists.
+- Support multiple sheets, autofilters, hidden sheets and cell formatting.
+- Update existing XLSX sheets and pivot-table ranges.
+- Targets `net8.0`, `net9.0` and `net10.0`.
+- NativeAOT and trimming analyzers enabled for the library.
 
 ## Installation
 
 ```bash
-dotnet add package SpreadSheetTasks
+dotnet add package SpreadSheetTasks --version 1.0.1
 ```
+
+Or add the package reference manually:
 
 ```xml
-<PackageReference Include="SpreadSheetTasks" Version="1.0.0" />
+<PackageReference Include="SpreadSheetTasks" Version="1.0.1" />
 ```
 
-## Quick Start
+## Quick start
 
-### Write to Excel
+### Write an XLSX or XLSB file
 
 ```csharp
 using SpreadSheetTasks;
 using System.Data;
 
-var dt = new DataTable();
-dt.Columns.Add("Name", typeof(string));
-dt.Columns.Add("Age", typeof(int));
-dt.Rows.Add("Alice", 30);
-dt.Rows.Add("Bob", 25);
+var table = new DataTable();
+table.Columns.Add("Name", typeof(string));
+table.Columns.Add("Age", typeof(int));
+table.Rows.Add("Alice", 30);
+table.Rows.Add("Bob", 25);
 
-using (var writer = new XlsxWriter("output.xlsx")) // or XlsbWriter
-{
-    writer.AddSheet("People");
-    writer.WriteSheet(dt.CreateDataReader());
-}
+using var writer = new XlsxWriter("people.xlsx"); // or XlsbWriter
+writer.AddSheet("People");
+writer.WriteSheet(table.CreateDataReader());
 ```
 
-### Read from Excel
+### Read rows without loading the whole workbook
 
 ```csharp
 using SpreadSheetTasks;
 
-using (var reader = new XlsxOrXlsbReadOrEdit())
-{
-    reader.Open("output.xlsx");
-    reader.ActualSheetName = "People";
+using var reader = new XlsxOrXlsbReadOrEdit();
+reader.Open("people.xlsx");
+reader.ActualSheetName = "People";
 
-    object[]? row = null;
-    while (reader.Read())
-    {
-        row ??= new object[reader.FieldCount];
-        reader.GetValues(row);
-    }
+while (reader.Read())
+{
+    string name = reader.GetString(0);
+    int age = reader.GetInt32(1);
+    Console.WriteLine($"{name}: {age}");
 }
 ```
+
+### Write typed rows
+
+```csharp
+using SpreadSheetTasks;
+
+var headers = new List<string> { "Product", "Price", "Quantity" };
+var types = new List<TypeCode> { TypeCode.String, TypeCode.Double, TypeCode.Int32 };
+var rows = new List<object?[]>
+{
+    new object?[] { "Apple", 1.99, 100 },
+    new object?[] { "Banana", 0.99, 250 }
+};
+
+using var writer = ExcelWriter.CreateWriter("products.xlsx");
+writer.AddSheet("Products");
+writer.WriteSheet(headers, types, rows, doAutofilter: true);
+```
+
+## NativeAOT and trimming
+
+The package enables the .NET AOT and trimming analyzers and is tested with a
+published NativeAOT application. The supported package target frameworks are
+`net8.0`, `net9.0` and `net10.0`.
+
+For an application, publish for a concrete runtime identifier:
+
+```bash
+dotnet publish -c Release -r win-x64 --self-contained true -p:PublishAot=true
+```
+
+The repository contains a runnable AOT smoke test covering XLSX, XLSB,
+`DataTable`, typed list rows and stream writing. See the complete
+[performance and NativeAOT guide](docs/performance-and-aot.md).
 
 ## Documentation
 
-Full usage guide with detailed examples:
-- [docs/index.md](docs/index.md)
+- [Complete usage guide](docs/index.md)
+- [Performance and NativeAOT](docs/performance-and-aot.md)
+- [GitHub repository](https://github.com/KrzysztofDusko/SpreadSheetTasks)
+- [NuGet package](https://www.nuget.org/packages/SpreadSheetTasks/)
 
-### Write from object[][] (typed headers)
+## Performance
 
-```csharp
-using SpreadSheetTasks;
+The repository includes BenchmarkDotNet projects for regular .NET 10 execution
+and a focused comparison between .NET 10 JIT and .NET 10 NativeAOT. Benchmark
+commands, environment details and measured results are maintained in
+[docs/performance-and-aot.md](docs/performance-and-aot.md).
 
-using (var writer = new XlsxWriter("products.xlsx"))
-{
-    writer.AddSheet("Products");
-    writer.WriteSheet(
-        rows: new object[][]
-        {
-            new object[] { "Apple", 1.99, 100 },
-            new object[] { "Banana", 0.99, 250 },
-        },
-        headers: new[] { "Product", "Price", "Quantity" },
-        headers_row: true,
-        doAutofilter: true
-    );
-}
-```
+Benchmark results depend on CPU, storage, operating system, input files and
+runtime version. Always reproduce measurements on the target environment before
+making capacity or latency commitments.
 
-### Write with per-cell formatting (FormattedCell[][])
+## Compatibility notes
 
-```csharp
-using SpreadSheetTasks;
+Version 1.0.0 introduced the following corrected names:
 
-using (var writer = new XlsxWriter("formatted.xlsx"))
-{
-    writer.AddSheet("Sheet1");
-    writer.WriteSheet(
-        rows: new object[][]
-        {
-            new object[] { 1234567, 1234.56 },
-            new object[] { 0.25, 12345.67 },
-        },
-        headers: new[] { "Thousands", "Scientific" },
-        formats: new FormattedCell[][]
-        {
-            new FormattedCell[] { new(1234567, F.THOUSANDS_SEP), new(1234.56, F.CURRENCY_PLN) },
-            new FormattedCell[] { new(0.25, F.PERCENTAGE), new(12345.67, F.SCIENTIFIC) },
-        }
-    );
-}
-```
-
-### GetExcelDataType / GetNativeValue
-
-```csharp
-using SpreadSheetTasks;
-
-using (var reader = new XlsxOrXlsbReadOrEdit())
-{
-    reader.Open("data.xlsx");
-    reader.ActualSheetName = "Sheet1";
-
-    while (reader.Read())
-    {
-        // Use typed getters for general use
-        string name = reader.GetString(0);
-        long value = reader.GetInt64(1);
-
-        // Use GetExcelDataType to inspect cell type
-        ExcelDataType type = reader.GetExcelDataType(2);
-
-        // High-performance escape hatch (check type first!)
-        if (type == ExcelDataType.Double)
-        {
-            double raw = reader.GetNativeValue(2).doubleValue;
-        }
-    }
-}
-```
-
-### Update existing XLSX (ReplaceSheetData + ReplacePivotTableDim)
-
-```csharp
-using SpreadSheetTasks;
-using System.Data;
-
-using (var reader = new XlsxOrXlsbReadOrEdit())
-{
-    reader.Open("existing.xlsx", updateMode: true);
-
-    var newData = new DataTable();
-    newData.Columns.Add("Product", typeof(string));
-    newData.Columns.Add("Revenue", typeof(decimal));
-    newData.Rows.Add("Widget", 50000m);
-
-    // Replace data in a sheet
-    string range = reader.ReplaceSheetData("Sheet1", newData.CreateDataReader());
-
-    // Update pivot table data source reference
-    reader.ReplacePivotTableDim("PivotTable1", range);
-}
-```
-
-### Write to existing Stream (XlsxWriter.WriteToExisting)
-
-```csharp
-using SpreadSheetTasks;
-using System.Data;
-using System.IO;
-using System.IO.Compression;
-
-// Open an existing xlsx as a ZipArchive and write into a sheet stream
-using (var archive = ZipFile.Open("existing.xlsx", ZipArchiveMode.Update))
-{
-    var entry = archive.GetEntry("xl/worksheets/sheet1.xml");
-    using var writer = new StreamWriter(entry.Open());
-
-    var dt = new DataTable();
-    dt.Columns.Add("Name", typeof(string));
-    dt.Rows.Add("Alice");
-
-    int rowsWritten = XlsxWriter.WriteToExisting(writer, dt.CreateDataReader());
-}
-```
-
-### Stream writer with custom buffer size
-
-```csharp
-using SpreadSheetTasks;
-using System.Data;
-
-// Larger buffer for better write throughput on large files
-using (var writer = new XlsxWriter("large.xlsx", bufferSize: 65536))
-{
-    writer.AddSheet("Data");
-    var dt = new DataTable();
-    dt.Columns.Add("Col", typeof(string));
-    for (int i = 0; i < 100_000; i++) dt.Rows.Add($"Row{i}");
-    writer.WriteSheet(dt.CreateDataReader());
-}
-```
-
-## Breaking Changes in v1.0.0
-
-| Old (v0.6.1) | New (v1.0.0) |
+| Previous name | Current name |
 |---|---|
-| `GetScheetNames()` (typo) | `GetSheetNames()` |
-| `DocPopertyProgramName` (typo) | `DocPropertyProgramName` |
+| `GetScheetNames()` | `GetSheetNames()` |
+| `DocPopertyProgramName` | `DocPropertyProgramName` |
 | `SuppressSomeDate` | `SuppressYear1000Dates` |
-| `overLimit` parameter | `maxRows` parameter |
-| `RowCount` returns `123123123` for unknown | `RowCount` returns `-1` for unknown |
-| `FormattingStreamWriter` (public) | `FormattingStreamWriter` (internal) |
-| `UseMemoryStreamInXlsb` (field) | `UseMemoryStreamInXlsb` (property) |
-| Duplicate `F.SHORT_DATE` etc. constants | Marked `[Obsolete]` |
+| `overLimit` | `maxRows` |
+| `UseMemoryStreamInXlsb` field | `UseMemoryStreamInXlsb` property |
 
-Old names still compile with `[Obsolete]` warnings.
+The old members remain available with `[Obsolete]` warnings where applicable.
 
-## Benchmarks
+## License
 
-### Windows 11 (25H2), AMD Ryzen 7 7840HS, .NET 10.0.8, BenchmarkDotNet 0.15.8
-
-#### XLSB Read (65k rows)
-| Method                                      | Mean     | Error     | StdDev  | Gen0      | Gen1     | Gen2     | Allocated |
-|-------------------------------------------- |---------:|----------:|--------:|----------:|---------:|---------:|----------:|
-| 'SpreadSheetTasks - XLSB Read - v1' (quick)   | 52.56 ms |  3.121 ms | 0.17 ms | 2400.0000 | 800.0000 | 700.0000 | 28.93 MB |
-| 'SpreadSheetTasks - XLSB Read - v2' (quick)   | 60.61 ms | 67.866 ms | 3.72 ms | 1666.6667 |        - |        - | 13.76 MB |
-
-#### XLSX Read (65k rows, typed getters)
-| Method              | Mean     | Error    | StdDev  | Allocated |
-|-------------------- |---------:|---------:|--------:|----------:|
-| SpreadSheetTasks65k | 178.2 ms | 124.7 ms | 6.83 ms | 593.92 KB |
-
-#### XLSB Write (50k rows, mixed types)
-| Method                          | ReaderType | Mean     | Error     | StdDev  | Gen0      | Gen1     | Gen2     | Allocated |
-|-------------------------------- |----------- |---------:|----------:|--------:|----------:|---------:|---------:|----------:|
-| 'SpreadSheetTasks - XLSB Write' | GENERAL    | 40.40 ms | 13.952 ms | 0.77 ms |  916.6667 | 166.6667 | 83.3333 | 10.86 MB |
-| XlsbSylvanWrite                 | GENERAL    | 51.34 ms | 12.901 ms | 0.71 ms |  545.4545 | 181.8182 | 90.9091 |  8.98 MB |
-
-#### XLSX Write (50k rows, mixed types)
-| Method                          | ReaderType | Mean     | Error     | StdDev  | Gen0      | Gen1      | Gen2     | Allocated |
-|-------------------------------- |----------- |---------:|----------:|--------:|----------:|----------:|--------:|----------:|
-| 'SpreadSheetTasks - XLSX Write' | GENERAL    | 58.08 ms |  8.808 ms | 0.48 ms | 1111.1111 |  111.1111 |       - | 13.31 MB |
-| XlsxSylvanWrite                 | GENERAL    | 73.63 ms | 73.330 ms | 4.02 ms |  571.4286 |  142.8571 |       - | 10.51 MB |
-
-### macOS Tahoe 26.5.1 (Apple M4), .NET 10.0.8, BenchmarkDotNet 0.15.8
-
-#### XLSB Read (65k rows)
-| Method                                      | Mean     | Error     | StdDev  | Gen0      | Gen1     | Gen2     | Allocated |
-|-------------------------------------------- |---------:|----------:|--------:|----------:|---------:|---------:|----------:|
-| 'SpreadSheetTasks - XLSB Read - v1' (quick)   | 40.56 ms |  2.895 ms | 1.59 ms | 2461.5385 | 846.1538 | 769.2308 |  28.93 MB |
-| 'SpreadSheetTasks - XLSB Read - v2' (quick)   | 47.62 ms |  3.617 ms | 1.98 ms | 1666.6667 |        - |        - |  13.76 MB |
-
-#### XLSX Read (65k rows, typed getters)
-| Method              | Mean     | Error    | StdDev  | Allocated |
-|-------------------- |---------:|---------:|--------:|----------:|
-| SpreadSheetTasks65k | 152.3 ms |  1.29 ms | 1.01 ms |  593.88 KB |
-
-#### XLSB Write (50k rows, mixed types)
-| Method                          | ReaderType | Mean     | Error     | StdDev  | Gen0      | Gen1     | Gen2     | Allocated |
-|-------------------------------- |----------- |---------:|----------:|--------:|----------:|---------:|---------:|----------:|
-| 'SpreadSheetTasks - XLSB Write'  | GENERAL    | 23.97 ms |  0.178 ms | 0.166 ms |  968.7500 | 187.5000 | 93.7500 |  10.86 MB |
-| XlsbSylvanWrite                 | GENERAL    | 32.48 ms |  0.509 ms | 0.425 ms |  562.5000 | 187.5000 | 125.0000 |   8.98 MB |
-
-#### XLSX Write (50k rows, mixed types)
-| Method                          | ReaderType | Mean     | Error     | StdDev  | Gen0      | Gen1      | Gen2     | Allocated |
-|-------------------------------- |----------- |---------:|----------:|--------:|----------:|----------:|--------:|----------:|
-| 'SpreadSheetTasks - XLSX Write' | GENERAL    | 41.43 ms |  0.781 ms | 0.731 ms | 1230.7692 | 230.7692 |        - |  13.31 MB |
-| XlsxSylvanWrite                 | GENERAL    | 41.18 ms |  0.495 ms | 0.386 ms |  750.0000 | 250.0000 | 83.3333 |  10.51 MB |
-
-## Links
-
-- NuGet: https://www.nuget.org/packages/SpreadSheetTasks/
-- GitHub: https://github.com/KrzysztofDusko/SpreadSheetTasks
-- License: MIT
+SpreadSheetTasks is released under the [MIT License](LICENSE).

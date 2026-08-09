@@ -15,7 +15,7 @@ internal sealed class ReaderFromList : DbDataReader
     private readonly int _fieldCount;
     private readonly int _rowsCnt;
     private readonly string[] _typeNames;
-    private readonly Type[] _types;
+    private readonly TypeCode[] _typeCodes;
     public ReaderFromList(List<object?[]> rows, List<string> headers, List<TypeCode> typeCodes)
     {
         _rows = rows;
@@ -28,14 +28,37 @@ internal sealed class ReaderFromList : DbDataReader
             _currentRow = _rows[0];
         }
         _typeNames = new string[_fieldCount];
-        _types = new Type[_fieldCount];
+        _typeCodes = new TypeCode[_fieldCount];
 
         for (int i = 0; i < _fieldCount; i++)
         {
             _typeNames[i] = typeCodes[i].ToString();
-            _types[i] = Type.GetType("System." + _typeNames[i]);
+            _typeCodes[i] = typeCodes[i];
         }
     }
+
+    [return: DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicProperties | DynamicallyAccessedMemberTypes.PublicFields)]
+    private static Type GetTypeFor(TypeCode typeCode) => typeCode switch
+    {
+        TypeCode.Boolean => typeof(bool),
+        TypeCode.Char => typeof(char),
+        TypeCode.SByte => typeof(sbyte),
+        TypeCode.Byte => typeof(byte),
+        TypeCode.Int16 => typeof(short),
+        TypeCode.UInt16 => typeof(ushort),
+        TypeCode.Int32 => typeof(int),
+        TypeCode.UInt32 => typeof(uint),
+        TypeCode.Int64 => typeof(long),
+        TypeCode.UInt64 => typeof(ulong),
+        TypeCode.Single => typeof(float),
+        TypeCode.Double => typeof(double),
+        TypeCode.Decimal => typeof(decimal),
+        TypeCode.DateTime => typeof(DateTime),
+        TypeCode.String => typeof(string),
+        TypeCode.DBNull => typeof(DBNull),
+        TypeCode.Empty or TypeCode.Object => typeof(object),
+        _ => typeof(object)
+    };
 
     private int _currentRowNum = -1;
     private object?[] _currentRow;
@@ -107,7 +130,7 @@ internal sealed class ReaderFromList : DbDataReader
     [return: DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicProperties | DynamicallyAccessedMemberTypes.PublicFields)]
     public override Type GetFieldType(int ordinal)
     {
-        return _types[ordinal];
+        return GetTypeFor(_typeCodes[ordinal]);
     }
 
     public override float GetFloat(int ordinal)

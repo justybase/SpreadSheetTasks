@@ -1,5 +1,7 @@
 <Solution>
   <Project Path="Benchmark/Benchmark.csproj" />
+  <Project Path="BenchmarkAot/BenchmarkAot.csproj" />
+  <Project Path="AotSmoke/AotSmoke.csproj" />
   <Project Path="SpreadSheetTasks/SpreadSheetTasks.csproj" />
   <Project Path="Tests/Tests.csproj" />
 </Solution>

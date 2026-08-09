@@ -34,6 +34,13 @@ jobs:
       - name: Test
         run: dotnet test source/Tests/Tests.csproj -c Release --no-build --nologo
 
+      - name: Publish NativeAOT smoke test
+        run: dotnet publish source/AotSmoke/AotSmoke.csproj -c Release -r win-x64 --self-contained true -p:PublishAot=true -o artifacts/aot-smoke --nologo
+
+      - name: Run NativeAOT smoke test
+        run: |
+          & .\artifacts\aot-smoke\AotSmoke.exe
+
       - name: Pack
         run: dotnet pack source/SpreadSheetTasks/SpreadSheetTasks.csproj -c Release --no-build -o artifacts --nologo
 

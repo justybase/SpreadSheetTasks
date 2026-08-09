@@ -34,6 +34,7 @@
    - [ReplaceSheetData + ReplacePivotTableDim](#replacesheetdata--replacepivottabledim)
 6. [Breaking Changes in v1.0.0](#breaking-changes-in-v100)
 7. [Format constants (F class)](#format-constants-f-class)
+8. [Performance and NativeAOT](performance-and-aot.md)
 
 ---
 
@@ -44,8 +45,14 @@ dotnet add package SpreadSheetTasks
 ```
 
 ```xml
-<PackageReference Include="SpreadSheetTasks" Version="1.0.0" />
+<PackageReference Include="SpreadSheetTasks" Version="1.0.1" />
 ```
+
+## Performance and NativeAOT
+
+See the dedicated [performance and NativeAOT guide](performance-and-aot.md)
+for the support matrix, publish smoke test and .NET 10 versus NativeAOT
+benchmark commands and results.
 
 ---
 

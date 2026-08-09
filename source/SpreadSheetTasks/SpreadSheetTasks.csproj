@@ -3,25 +3,27 @@
 	<TargetFrameworks>net10.0;net9.0;net8.0</TargetFrameworks>
 	<Nullable>enable</Nullable>
 	<IsAotCompatible>true</IsAotCompatible>
-    <!--<TreatWarningsAsErrors>true</TreatWarningsAsErrors>-->
+    <EnableAotAnalyzer>true</EnableAotAnalyzer>
+    <EnableTrimAnalyzer>true</EnableTrimAnalyzer>
+    <EnableSingleFileAnalyzer>true</EnableSingleFileAnalyzer>
+    <WarningsAsErrors>IL2026;IL2027;IL2093;IL3050;IL3051;IL3052;IL3053;IL3054;IL3055;IL3056;IL3057;IL3058;IL3059;IL3060;IL3061;IL3062;IL3063;IL3064;IL3065</WarningsAsErrors>
 	<RootNamespace>SpreadSheetTasks</RootNamespace>
     <Authors>Krzysztof Duśko</Authors>
 	<Company>Krzysztof Duśko</Company>
-    <Description>The .NET library for fast reading and writing Excel files (.xlsx, .xlsb)</Description>
+    <Description>High-performance .NET library for reading and writing Excel files (.xlsx, .xlsb), with streaming APIs and NativeAOT validation.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
 	<PackageReadmeFile>README.md</PackageReadmeFile>
     <AssemblyVersion>1.0.1.0</AssemblyVersion>
     <FileVersion>1.0.1.0</FileVersion>
 	 <Version>1.0.1</Version>
 	<LangVersion>latest</LangVersion>
-    <PackageReleaseNotes>XLSB read performance improvements (span-based record parsing, 64 KiB buffered streaming), stress tests</PackageReleaseNotes>
-    <PackageTags>xlsx;xlsb;excel;spreadsheets</PackageTags>
+    <PackageReleaseNotes>XLSB read performance improvements, NativeAOT compatibility analyzers and NativeAOT smoke validation.</PackageReleaseNotes>
+    <PackageTags>xlsx;xlsb;excel;spreadsheets;nativeaot;aot;trimming</PackageTags>
     <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
     <RepositoryUrl>https://github.com/KrzysztofDusko/SpreadSheetTasks</RepositoryUrl>
     <PackageProjectUrl>https://github.com/KrzysztofDusko/SpreadSheetTasks</PackageProjectUrl>
     <AllowUnsafeBlocks>True</AllowUnsafeBlocks>
 	  <IsTrimmable>true</IsTrimmable>
-	  <EnableTrimAnalyzer>true</EnableTrimAnalyzer>
   </PropertyGroup>
 	<ItemGroup>
 		<None Include="..\..\README.md" Pack="true" PackagePath="\" />
