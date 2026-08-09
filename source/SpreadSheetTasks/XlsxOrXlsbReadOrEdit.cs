@@ -171,19 +171,20 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
 
         var e1 = _xlsxArchive.GetEntry("xl/workbook.bin");
 
-        Stream str;
+        BiffReaderWriter reader;
+        Stream? str = null;
         if (UseMemoryStreamInXlsb)
         {
-            str = GetMemoryStream(e1.Open(), e1.Length);
+            reader = new BiffReaderWriter(ReadEntryToBytes(e1.Open(), e1.Length));
         }
         else
         {
             str = new BufferedStream(e1.Open());
+            reader = new BiffReaderWriter(str);
         }
 
         try
         {
-            using var reader = new BiffReaderWriter(str);
             while (reader.ReadWorkbook())
             {
                 if (reader._isSheet == true)
@@ -197,7 +198,7 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
         }
         finally
         {
-            str.Dispose();
+            str?.Dispose();
         }
 
 
@@ -288,26 +289,33 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
     /// xlsb read strategy, true = More RAM needed but faster
     /// </summary>
     public bool UseMemoryStreamInXlsb = true;
-    private static MemoryStream GetMemoryStream(Stream streamToRead, long length)
+    private static byte[] ReadEntryToBytes(Stream streamToRead, long length)
     {
         byte[] byteArray = new byte[length];
         int bytesRead = 0;
         int toRead = 65_536;
-        while (true)
+        try
         {
-            if (length - bytesRead < toRead)
+            while (true)
             {
-                toRead = (int)length - bytesRead;
-            }
+                if (length - bytesRead < toRead)
+                {
+                    toRead = (int)length - bytesRead;
+                }
 
-            int pos = streamToRead.Read(byteArray, bytesRead, toRead);
-            bytesRead += pos;
-            if (pos == 0)
-            {
-                break;
+                int pos = streamToRead.Read(byteArray, bytesRead, toRead);
+                bytesRead += pos;
+                if (pos == 0)
+                {
+                    break;
+                }
             }
+            return byteArray;
         }
-        return new MemoryStream(byteArray);
+        finally
+        {
+            streamToRead.Dispose();
+        }
     }
 
     public void FillSharedStrings()
@@ -402,19 +410,20 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
 
         var sharedstringsEntry = _xlsxArchive.GetEntry($@"xl/{_sharedStringsLocation}");
 
-        Stream str;
+        BiffReaderWriter reader;
+        Stream? str = null;
         if (UseMemoryStreamInXlsb)
         {
-            str = GetMemoryStream(sharedstringsEntry.Open(), sharedstringsEntry.Length);
+            reader = new BiffReaderWriter(ReadEntryToBytes(sharedstringsEntry.Open(), sharedstringsEntry.Length));
         }
         else
         {
             str = new BufferedStream(sharedstringsEntry.Open());
+            reader = new BiffReaderWriter(str);
         }
 
         try
         {
-            using var reader = new BiffReaderWriter(str);
             int stringNum = 0;
 
             reader.ReadSharedStrings();
@@ -448,7 +457,7 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
         }
         finally
         {
-            str.Dispose();
+            str?.Dispose();
         }
 
     }
@@ -968,13 +977,13 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
         }
         if (UseMemoryStreamInXlsb)
         {
-            _sheetStream = GetMemoryStream(_sheetEntry.Open(), _sheetEntry.Length);
+            _biffReader = new BiffReaderWriter(ReadEntryToBytes(_sheetEntry.Open(), _sheetEntry.Length));
         }
         else
         {
             _sheetStream = new BufferedStream(_sheetEntry.Open());
+            _biffReader = new BiffReaderWriter(_sheetStream);
         }
-        _biffReader = new BiffReaderWriter(_sheetStream);
 
         while (!_biffReader._readCell) //read to cell
         {
@@ -1005,7 +1014,7 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
         if (!_returnValue)
         {
             _biffReader.Dispose();
-            _sheetStream.Dispose();
+            _sheetStream?.Dispose();
             _isFirstRow = true; // RESET
             return false;
         }

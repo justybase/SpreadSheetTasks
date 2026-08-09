@@ -1,8 +1,10 @@
 ﻿using System;
 using System.Buffers;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Data;
 using System.IO;
+using System.Text;
 
 namespace SpreadSheetTasks
 {
@@ -39,55 +41,21 @@ namespace SpreadSheetTasks
         private const uint _formulaBool = 0x0a;
         private const uint _formulaError = 0x0b;
 
-        // private const uint WorksheetBegin = 0x81;
-        // private const uint WorksheetEnd = 0x82;
-        //private const uint SheetDataBegin = 0x91;
-        //private const uint SheetDataEnd = 0x92;
-        //private const uint SheetPr = 0x93; // == BrtWsProp
-        //private const uint SheetFormatPr = 0x1E5;
-
-        // private const uint ColumnsBegin = 0x186;
-        //private const uint Column = 0x3C; // column info
-
-        // private const uint ColumnsEnd = 0x187;
-        //private const uint HeaderFooter = 0x1DF;
-
-        // private const uint MergeCellsBegin = 0x00B1; //177
-        // private const uint MergeCellsEnd = 0x00B2; //178
-        //private const uint MergeCell = 0x00B0; // 176
-
-        //private const uint BrtBeginSheet = 0x0081; // 129
-        //private const uint BrtWsProp = 0x0093; // 147 // SheetPr
-        //private const uint LHRecord = 0x0094; // 148
-        //private const uint BrtBeginWsViews = 0x0085;//133
-        //private const uint BrtBeginWsView = 0x0089; // 137
-        //private const uint BrtSel = 0x0098; // 152
-        //private const uint BrtEndWsView = 0x008A; // 138
-        //private const uint BrtEndWsViews = 0x0086; //134
-
-        //private const uint BrtACBegin = 0x0025;// 37
-        //private const uint BrtWsFmtInfoEx14 = 0x0415;//1045
-        //private const uint BrtACEnd = 0x0026;//38
-        //private const uint BrtWsFmtInfo = 0x01E5;//485
-
-        //private const uint BrtBeginSheetData = 0x0091;//145
-        //private const uint BrtRwDescent = 0x0400;//1024
-        //private const uint BrtEndSheetData = 0x0092;//146
-
-        //private const uint BrtSheetProtection = 0x0217;//535
-        //private const uint BrtPhoneticInfo = 0x0219;//537
-        //private const uint BrtPrintOptions = 0x01DD;//477
-        //private const uint BrtMargins = 0x01DC;//476
-        //private const uint BrtUid = 0x0C00;//3072
-        //private const uint BrtEndSheet = 0x0082;//130
-
-
         private readonly byte[] _buffer = new byte[128];
-        Stream Stream { get; }
+        private readonly Stream? Stream;
+
+        // fast path: cale dane w pamieci (byte[]), zero kopii przy odczycie rekordow
+        private readonly byte[]? _data;
+        private int _pos;
 
         public BiffReaderWriter(Stream stream)
         {
             Stream = stream ?? throw new ArgumentNullException(nameof(stream));
+        }
+
+        public BiffReaderWriter(byte[] data)
+        {
+            _data = data ?? throw new ArgumentNullException(nameof(data));
         }
 
         private enum SheetVisibility : byte
@@ -104,7 +72,17 @@ namespace SpreadSheetTasks
 
         internal bool ReadWorkbook()
         {
-            if (!TryReadVariableValue(out var recordId) ||
+            if (_data != null)
+            {
+                if (!BeginRecord(out var recordId, out var data))
+                {
+                    return false;
+                }
+                ParseWorkbookRecord(recordId, data);
+                return true;
+            }
+
+            if (!TryReadVariableValue(out var recordId2) ||
                 !TryReadVariableValue(out var recordLength))
                 return false;
             byte[]? rented = null;
@@ -115,28 +93,33 @@ namespace SpreadSheetTasks
                     buffer = _buffer;
                 else
                     buffer = rented = ArrayPool<byte>.Shared.Rent((int)recordLength);
-                if (Stream.Read(buffer, 0, (int)recordLength) != recordLength)
+                if (Stream!.Read(buffer, 0, (int)recordLength) != recordLength)
                     return false;
 
-                _isSheet = false;
-                if (recordId == _sheet)
-                {
-                    _workbookId = GetDWord(buffer, 4);
-
-                    uint offset = 8;
-                    _recId = GetNullableString(buffer, ref offset);
-
-                    // Must be between 1 and 31 characters
-                    uint nameLength = GetDWord(buffer, offset);
-                    _workbookName = GetString(buffer, offset + 4, nameLength);
-                    _isSheet = true;
-                }
+                ParseWorkbookRecord(recordId2, buffer.AsSpan(0, (int)recordLength));
                 return true;
             }
             finally
             {
                 if (rented != null)
                     ArrayPool<byte>.Shared.Return(rented);
+            }
+        }
+
+        private void ParseWorkbookRecord(uint recordId, ReadOnlySpan<byte> data)
+        {
+            _isSheet = false;
+            if (recordId == _sheet)
+            {
+                _workbookId = GetDWord(data, 4);
+
+                int offset = 8;
+                _recId = GetNullableString(data, ref offset);
+
+                // Must be between 1 and 31 characters
+                uint nameLength = GetDWord(data, offset);
+                _workbookName = GetString(data, offset + 4, nameLength);
+                _isSheet = true;
             }
         }
 
@@ -153,7 +136,17 @@ namespace SpreadSheetTasks
 
         public bool ReadStyles()
         {
-            if (!TryReadVariableValue(out var recordId) ||
+            if (_data != null)
+            {
+                if (!BeginRecord(out var recordId, out var data))
+                {
+                    return false;
+                }
+                ParseStylesRecord(recordId, data);
+                return true;
+            }
+
+            if (!TryReadVariableValue(out var recordId2) ||
                 !TryReadVariableValue(out var recordLength))
                 return false;
 
@@ -165,9 +158,21 @@ namespace SpreadSheetTasks
                     buffer = _buffer;
                 else
                     buffer = rented = ArrayPool<byte>.Shared.Rent((int)recordLength);
-                if (Stream.Read(buffer, 0, (int)recordLength) != recordLength)
+                if (Stream!.Read(buffer, 0, (int)recordLength) != recordLength)
                     return false;
 
+                ParseStylesRecord(recordId2, buffer.AsSpan(0, (int)recordLength));
+                return true;
+            }
+            finally
+            {
+                if (rented != null)
+                    ArrayPool<byte>.Shared.Return(rented);
+            }
+        }
+
+        private void ParseStylesRecord(uint recordId, ReadOnlySpan<byte> data)
+        {
             switch (recordId)
             {
                 case _cellXfStart:
@@ -193,8 +198,8 @@ namespace SpreadSheetTasks
                     break;
                 case _xf when _inCellXf:
                     {
-                        _parentCellStyleXf = GetWord(buffer, 0);
-                        _numberFormatIndex = GetWord(buffer, 2);
+                        _parentCellStyleXf = GetWord(data, 0);
+                        _numberFormatIndex = GetWord(data, 2);
                         //var FontIndex = GetWord(buffer, 4);
                         break;
                     }
@@ -202,20 +207,12 @@ namespace SpreadSheetTasks
                 case _numberFormat when _inNumberFormat:
                     {
                         // Must be between 1 and 255 characters
-                        _format = GetWord(buffer, 0);
-                        uint length = GetDWord(buffer, 2);
-                        _formatString = GetString(buffer, 2 + 4, length);
+                        _format = GetWord(data, 0);
+                        uint length = GetDWord(data, 2);
+                        _formatString = GetString(data, 2 + 4, length);
 
                         break;
                     }
-            }
-
-            return true;
-            }
-            finally
-            {
-                if (rented != null)
-                    ArrayPool<byte>.Shared.Return(rented);
             }
         }
 
@@ -223,7 +220,17 @@ namespace SpreadSheetTasks
         internal uint _sharedStringUniqueCount = 0;
         public bool ReadSharedStrings()
         {
-            if (!TryReadVariableValue(out var recordId) ||
+            if (_data != null)
+            {
+                if (!BeginRecord(out var recordId, out var data))
+                {
+                    return false;
+                }
+                ParseSharedStringsRecord(recordId, data);
+                return true;
+            }
+
+            if (!TryReadVariableValue(out var recordId2) ||
                 !TryReadVariableValue(out var recordLength))
                 return false;
 
@@ -239,34 +246,38 @@ namespace SpreadSheetTasks
                 uint readed = 0;
                 do
                 {
-                    readed += (uint)Stream.Read(buffer, (int)readed, (int)(recordLength - readed));
+                    readed += (uint)Stream!.Read(buffer, (int)readed, (int)(recordLength - readed));
                     if (readed == 0)
                     {
                         return false;
                     }
                 } while (readed < recordLength);
 
-            if (recordId == _stringItem)
-            {
-                uint length = GetDWord(buffer, 1);
-                _sharedStringValue = GetString(buffer, 1 + 4, length);
-            }
-            else if (recordId == _sharedStringStart)
-            {
-                _sharedStringUniqueCount = GetDWord(buffer, 4);
-                _sharedStringValue = null;
-            }
-            else
-            {
-                _sharedStringValue = null;
-            }
-
-            return true;
+                ParseSharedStringsRecord(recordId2, buffer.AsSpan(0, (int)recordLength));
+                return true;
             }
             finally
             {
                 if (rented != null)
                     ArrayPool<byte>.Shared.Return(rented);
+            }
+        }
+
+        private void ParseSharedStringsRecord(uint recordId, ReadOnlySpan<byte> data)
+        {
+            if (recordId == _stringItem)
+            {
+                uint length = GetDWord(data, 1);
+                _sharedStringValue = GetString(data, 1 + 4, length);
+            }
+            else if (recordId == _sharedStringStart)
+            {
+                _sharedStringUniqueCount = GetDWord(data, 4);
+                _sharedStringValue = null;
+            }
+            else
+            {
+                _sharedStringValue = null;
             }
         }
 
@@ -285,7 +296,17 @@ namespace SpreadSheetTasks
 
         internal bool ReadWorksheet()
         {
-            if (!TryReadVariableValue(out var recordId) ||
+            if (_data != null)
+            {
+                if (!BeginRecord(out var recordId, out var data))
+                {
+                    return false;
+                }
+                ParseWorksheetRecord(recordId, data);
+                return true;
+            }
+
+            if (!TryReadVariableValue(out var recordId2) ||
                 !TryReadVariableValue(out var recordLength))
                 return false;
 
@@ -297,111 +318,30 @@ namespace SpreadSheetTasks
                     buffer = _buffer;
                 else
                     buffer = rented = ArrayPool<byte>.Shared.Rent((int)recordLength);
-                if (Stream.Read(buffer, 0, (int)recordLength) != recordLength)
+                if (Stream!.Read(buffer, 0, (int)recordLength) != recordLength)
                     return false;
 
+                ParseWorksheetRecord(recordId2, buffer.AsSpan(0, (int)recordLength));
+                return true;
+            }
+            finally
+            {
+                if (rented != null)
+                    ArrayPool<byte>.Shared.Return(rented);
+            }
+        }
+
+        private void ParseWorksheetRecord(uint recordId, ReadOnlySpan<byte> data)
+        {
             _readCell = false;
             _columnNum = -1;
             //isSharedStringVal = false;
 
             switch (recordId)
             {
-                //case BrtEndWsViews:
-                //    break;
-                //case BrtSel:
-                //    break;
-                //case SheetDataBegin:
-                //sheetDataBeginRecord = true;
-                //break;
-                //case SheetDataEnd:
-                //sheetDataBeginRecord = false;
-                //sheetDataEndRecord = true;
-                //break;
-                //case SheetPr: // BrtWsProp
-                //    {
-                //        // Must be between 0 and 31 characters
-                //        uint length = GetDWord(buffer, 19);
-
-                //        // To behave the same as when reading an xml based file. 
-                //        // GetAttribute returns null both if the attribute is missing
-                //        // or if it is empty.
-                //        string codeName = length == 0 ? null : GetString(buffer, 19 + 4, length);
-                //        //return new SheetPrRecord(codeName);
-                //        break;
-                //    }
-                //break;
-                //case SheetFormatPr: // BrtWsFmtInfo 
-                //{
-                //    // TODO Default column width
-                //    var unsynced = (buffer[8] & 0b1000) != 0;
-                //    uint? defaultHeight = null;
-                //    if (unsynced)
-                //        defaultHeight = GetWord(buffer, 6);
-                //    //return new SheetFormatPrRecord(defaultHeight);
-                //    break;
-                //}
-                //break;
-                //case Column: // BrtColInfo 
-                //    {
-                //        int minimum = GetInt32(buffer, 0);
-                //        int maximum = GetInt32(buffer, 4);
-                //        byte flags = buffer[16];
-                //        bool hidden = (flags & 0b1) != 0;
-                //        bool unsynced = (flags & 0b10) != 0;
-
-                //        double? width = null;
-                //        if (unsynced)
-                //            width = GetDWord(buffer, 8) / 256.0;
-                //        //return new ColumnRecord(new Column(minimum, maximum, hidden, width));
-                //        break;
-                //        //{0,0,0,0,0,0,0,36,59,0,0,0,0,0,0,2}
-                //    }
-                //break;
-                //case HeaderFooter: // BrtBeginHeaderFooter 
-                //{
-                //    var flags = buffer[0];
-                //    bool differentOddEven = (flags & 1) != 0;
-                //    bool differentFirst = (flags & 0b10) != 0;
-                //    uint offset = 2;
-                //    var header = GetNullableString(buffer, ref offset);
-                //    var footer = GetNullableString(buffer, ref offset);
-                //    var headerEven = GetNullableString(buffer, ref offset);
-                //    var footerEven = GetNullableString(buffer, ref offset);
-                //    var headerFirst = GetNullableString(buffer, ref offset);
-                //    var footerFirst = GetNullableString(buffer, ref offset);
-                //    break;
-                //}
-                //break;
-                //case BrtBeginSheetData:
-                //    Console.WriteLine("posiotion of BrtBeginSheetData");
-                //    Console.WriteLine(Stream.Position);
-                //    break;
-                //case BrtEndSheetData:
-                //    Console.WriteLine("posiotion of BrtEndSheetData");
-                //    Console.WriteLine(Stream.Position);
-                //    break;
-                //case BrtACBegin:
-                //    Console.WriteLine("posiotion of BrtACBegin");
-                //    Console.WriteLine(Stream.Position);
-                //    break;
-                //case BrtACEnd:
-                //    Console.WriteLine("posiotion of BrtACEnd");
-                //    Console.WriteLine(Stream.Position);
-                //    break;
-
-                //case BrtRwDescent:
-                //    Console.WriteLine("posiotion of BrtRwDescent");
-                //    Console.WriteLine(Stream.Position);
-                //    break;
-                //case MergeCell:
-                //int fromRow = GetInt32(buffer, 0);
-                //int toRow = GetInt32(buffer, 4);
-                //int fromColumn = GetInt32(buffer, 8);
-                //int toColumn = GetInt32(buffer, 12);
-                //break;
                 case _row: // BrtRowHdr 0 = 0x0000
                     {
-                        _rowIndex = GetInt32(buffer, 0);
+                        _rowIndex = GetInt32(data, 0);
                         //    byte flags = buffer[11];
                         //    bool hidden = (flags & 0b10000) != 0;
                         //    bool unsynced = (flags & 0b100000) != 0;
@@ -413,39 +353,26 @@ namespace SpreadSheetTasks
                         //    // TODO: Default format ?
                         break;
                     }
-                //case Blank: //BrtCellBlank
-                //return ReadCell(null);
-                //cellValue = null; 
-                //readCell = true;
-                //break;
                 case _blank: //BrtCellBlank (1 = 0x0001)
                 case _boolError:
                 case _formulaError: // BrtFmlaError (11 = 0x000B)
-                    //return ReadCell(null, (CellError)buffer[8]);
-                    //cellValue = null;
                     _readCell = true;
                     _cellType = CellType.nullValue;
                     break;
                 case _number:
-                    //return ReadCell(GetRkNumber(buffer, 8));
-                    //cellValue = GetRkNumber(buffer, 8);
-                    _doubleVal = GetRkNumber(buffer, 8);
+                    _doubleVal = GetRkNumber(data, 8);
                     _readCell = true;
                     _cellType = CellType.doubleVal;
                     break;
                 case _bool:
                 case _formulaBool:
-                    //return ReadCell(buffer[8] == 1);
-                    //cellValue = (buffer[8] == 1);
-                    _boolValue = (buffer[8] == 1);
+                    _boolValue = (data[8] == 1);
                     _readCell = true;
                     _cellType = CellType.boolVal;
                     break;
                 case _formulaNumber:
                 case _float:
-                    //return ReadCell(GetDouble(buffer, 8));
-                    //cellValue = GetDouble(buffer, 8);
-                    _doubleVal = GetDouble(buffer, 8);
+                    _doubleVal = GetDouble(data, 8);
                     _readCell = true;
                     _cellType = CellType.doubleVal;
                     break;
@@ -453,142 +380,65 @@ namespace SpreadSheetTasks
                 case _formulaString:
                     {
                         // Must be less than 32768 characters
-                        var length = GetDWord(buffer, 8);
-                        //return ReadCell(GetString(buffer, 8 + 4, length));
-                        //cellValue = GetString(buffer, 8 + 4, length);
-                        _stringValue = GetString(buffer, 8 + 4, length);
+                        var length = GetDWord(data, 8);
+                        _stringValue = GetString(data, 8 + 4, length);
                         _readCell = true;
                         _cellType = CellType.stringVal;
                         break;
                     }
                 case _sharedString:
-                    //return ReadCell((int)GetDWord(buffer, 8));
-                    //cellValue = (int)GetDWord(buffer, 8);
-                    _intValue = (int)GetDWord(buffer, 8);
+                    _intValue = (int)GetDWord(data, 8);
                     _readCell = true;
-                    //isSharedStringVal = true;
                     _cellType = CellType.sharedString;
                     break;
             }
 
             if (_readCell)
             {
-                _columnNum = (int)GetDWord(buffer, 0);
-                _xfIndex = GetDWord(buffer, 4) & 0xffffff;
-            }
-
-            return true;
-            }
-            finally
-            {
-                if (rented != null)
-                    ArrayPool<byte>.Shared.Return(rented);
+                _columnNum = (int)GetDWord(data, 0);
+                _xfIndex = GetDWord(data, 4) & 0xffffff;
             }
         }
 
         //https://github.com/ExcelDataReader/ExcelDataReader
-        static uint GetDWord(byte[] buffer, uint offset)
+        static uint GetDWord(ReadOnlySpan<byte> buffer, int offset)
         {
-            uint result = (uint)buffer[offset + 3] << 24;
-            result += (uint)buffer[offset + 2] << 16;
-            result += (uint)buffer[offset + 1] << 8;
-            result += buffer[offset];
-            return result;
-        }
-
-
-        //https://github.com/ExcelDataReader/ExcelDataReader
-        static int GetInt32(byte[] buffer, uint offset)
-        {
-            int result = buffer[offset + 3] << 24;
-            result += buffer[offset + 2] << 16;
-            result += buffer[offset + 1] << 8;
-            result += buffer[offset];
-            return result;
+            return BinaryPrimitives.ReadUInt32LittleEndian(buffer.Slice(offset, 4));
         }
 
         //https://github.com/ExcelDataReader/ExcelDataReader
-        static ushort GetWord(byte[] buffer, uint offset)
+        static int GetInt32(ReadOnlySpan<byte> buffer, int offset)
         {
-            ushort result = (ushort)(buffer[offset + 1] << 8);
-            result += buffer[offset];
-            return result;
+            return BinaryPrimitives.ReadInt32LittleEndian(buffer.Slice(offset, 4));
         }
 
         //https://github.com/ExcelDataReader/ExcelDataReader
-        /*public static string GetString(byte[] buffer, uint offset, uint length)
+        static ushort GetWord(ReadOnlySpan<byte> buffer, int offset)
         {
-            StringBuilder sb = new StringBuilder((int)length);
-            for (uint i = offset; i < offset + 2 * length; i += 2)
-                sb.Append((char)GetWord(buffer, i));
-            return sb.ToString();
+            return BinaryPrimitives.ReadUInt16LittleEndian(buffer.Slice(offset, 2));
+        }
+
+        private static string GetString(ReadOnlySpan<byte> buffer, int offset, uint length)
+        {
+            return Encoding.Unicode.GetString(buffer.Slice(offset, (int)length * 2));
         }
 
         //https://github.com/ExcelDataReader/ExcelDataReader
-        static string? GetNullableString(byte[] buffer, ref uint offset)
-        {
-            var length = GetDWord(buffer, offset);
-            offset += 4;
-            if (length == uint.MaxValue)
-                return null;
-            StringBuilder sb = new StringBuilder((int)length);
-            uint end = offset + length * 2;
-            for (; offset < end; offset += 2)
-                sb.Append((char)GetWord(buffer, offset));
-            return sb.ToString();
-        }*/
-
-
-        private static string GetString(byte[] buffer, uint offset, uint length)
-        {
-            //https://docs.microsoft.com/en-US/dotnet/api/system.string.create?view=net-5.0
-            return string.Create((int)length, (buffer, offset, length), (chars, state) =>
-            {
-                int l = 0;
-                byte[] buff = state.buffer;
-                for (uint i = state.offset; i < state.offset + 2 * state.length; i += 2)
-                    chars[l++] = (char)GetWord(buff, i);
-            });
-
-
-            //Span<char> array = stackalloc char[(int)length];
-            //int l = 0;
-            //for (uint i = offset; i < offset + 2 * length; i += 2)
-            //    array[l++] = (char)GetWord(buffer, i);
-
-            //return new string(array);
-
-            //char[] array = ArrayPool<char>.Shared.Rent((int)length);
-            //int l = 0;
-            //for (uint i = offset; i < offset + 2 * length; i += 2)
-            //    array[l++] = (char)GetWord(buffer, i);
-            //string s1 = new string(array.AsSpan().Slice(0, (int)length));
-            //ArrayPool<char>.Shared.Return(array);
-            //return s1;
-
-        }
-
-        //https://github.com/ExcelDataReader/ExcelDataReader
-        static string GetNullableString(byte[] buffer, ref uint offset)
+        static string GetNullableString(ReadOnlySpan<byte> buffer, ref int offset)
         {
             var length = GetDWord(buffer, offset);
             offset += 4;
             if (length == uint.MaxValue)
                 return null;
 
-            uint startOffset = offset;
-            offset += length * 2;
-            return string.Create((int)length, (buffer, startOffset), (chars, state) =>
-            {
-                int l = 0;
-                for (uint i = state.startOffset; i < state.startOffset + (uint)chars.Length * 2; i += 2)
-                    chars[l++] = (char)GetWord(state.buffer, i);
-            });
+            string result = Encoding.Unicode.GetString(buffer.Slice(offset, (int)length * 2));
+            offset += (int)length * 2;
+            return result;
         }
 
         //https://github.com/ExcelDataReader/ExcelDataReader
         //2.5.122 RkNumber
-        static double GetRkNumber(byte[] buffer, uint offset)
+        static double GetRkNumber(ReadOnlySpan<byte> buffer, int offset)
         {
             double result;
 
@@ -612,12 +462,9 @@ namespace SpreadSheetTasks
         }
 
         //https://github.com/ExcelDataReader/ExcelDataReader
-        static double GetDouble(byte[] buffer, uint offset)
+        static double GetDouble(ReadOnlySpan<byte> buffer, int offset)
         {
-            uint num = GetDWord(buffer, offset);
-            uint num2 = GetDWord(buffer, offset + 4);
-            long num3 = ((long)num2 << 32) | num;
-            return BitConverter.Int64BitsToDouble(num3);
+            return BitConverter.Int64BitsToDouble(BinaryPrimitives.ReadInt64LittleEndian(buffer.Slice(offset, 8)));
         }
 
         //https://github.com/ExcelDataReader/ExcelDataReader
@@ -626,7 +473,7 @@ namespace SpreadSheetTasks
         {
             value = 0;
 
-            if (Stream.Read(_buffer, 0, 1) == 0)
+            if (Stream!.Read(_buffer, 0, 1) == 0)
                 return false;
 
             byte b1 = _buffer[0];
@@ -659,9 +506,80 @@ namespace SpreadSheetTasks
             return true;
         }
 
+        // fast path: naglowek rekordu (varint id + varint dlugosc) z bufora w pamieci
+        private bool BeginRecord(out uint recordId, out ReadOnlySpan<byte> data)
+        {
+            recordId = 0;
+            data = default;
+            if (!ReadVarint(out recordId) || !ReadVarint(out uint length))
+            {
+                return false;
+            }
+            byte[] bytes = _data!;
+            if (length > (uint)(bytes.Length - _pos))
+            {
+                return false;
+            }
+            data = bytes.AsSpan(_pos, (int)length);
+            _pos += (int)length;
+            return true;
+        }
+
+        private bool ReadVarint(out uint value)
+        {
+            value = 0;
+            byte[] bytes = _data!;
+            int pos = _pos;
+
+            if (pos >= bytes.Length)
+            {
+                return false;
+            }
+            byte b1 = bytes[pos++];
+            value = (uint)(b1 & 0x7F);
+            if ((b1 & 0x80) == 0)
+            {
+                _pos = pos;
+                return true;
+            }
+
+            if (pos >= bytes.Length)
+            {
+                return false;
+            }
+            byte b2 = bytes[pos++];
+            value = ((uint)(b2 & 0x7F) << 7) | value;
+            if ((b2 & 0x80) == 0)
+            {
+                _pos = pos;
+                return true;
+            }
+
+            if (pos >= bytes.Length)
+            {
+                return false;
+            }
+            byte b3 = bytes[pos++];
+            value = ((uint)(b3 & 0x7F) << 14) | value;
+            if ((b3 & 0x80) == 0)
+            {
+                _pos = pos;
+                return true;
+            }
+
+            if (pos >= bytes.Length)
+            {
+                return false;
+            }
+            byte b4 = bytes[pos++];
+            value = ((uint)(b4 & 0x7F) << 21) | value;
+            _pos = pos;
+            return true;
+        }
+
         public void Dispose()
         {
-            Stream.Dispose();
+            Stream?.Dispose();
         }
 
         public override bool Equals(object? obj)
