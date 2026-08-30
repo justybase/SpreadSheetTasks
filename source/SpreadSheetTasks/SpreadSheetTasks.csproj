@@ -13,11 +13,11 @@
     <Description>High-performance .NET library for reading and writing Excel files (.xlsx, .xlsb), with streaming APIs and NativeAOT validation.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
 	<PackageReadmeFile>README.md</PackageReadmeFile>
-    <AssemblyVersion>1.0.1.0</AssemblyVersion>
-    <FileVersion>1.0.1.0</FileVersion>
-	 <Version>1.0.1</Version>
+    <AssemblyVersion>1.0.2.0</AssemblyVersion>
+    <FileVersion>1.0.2.0</FileVersion>
+	 <Version>1.0.2</Version>
 	<LangVersion>latest</LangVersion>
-    <PackageReleaseNotes>XLSB read performance improvements, NativeAOT compatibility analyzers and NativeAOT smoke validation.</PackageReleaseNotes>
+    <PackageReleaseNotes>Existing XLSX/XLSB worksheet updates with pivot-cache refresh metadata and correct 1904-date-system handling, plus NativeAOT smoke validation.</PackageReleaseNotes>
     <PackageTags>xlsx;xlsb;excel;spreadsheets;nativeaot;aot;trimming</PackageTags>
     <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
     <RepositoryUrl>https://github.com/KrzysztofDusko/SpreadSheetTasks</RepositoryUrl>

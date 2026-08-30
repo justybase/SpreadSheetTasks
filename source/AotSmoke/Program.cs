@@ -17,6 +17,8 @@ internal static class Program
             RunListRoundTrip(workDirectory, ".xlsx");
             RunListRoundTrip(workDirectory, ".xlsb");
             RunDataTableRoundTrip(workDirectory);
+            RunUpdaterRoundTrip(workDirectory, ".xlsx");
+            RunUpdaterRoundTrip(workDirectory, ".xlsb");
             RunStreamWriterSmokeTest();
             Console.WriteLine("NativeAOT smoke test passed.");
             return 0;
@@ -97,6 +99,45 @@ internal static class Program
         }
 
         Check(stream.Length > 0, "Stream writer produced no output.");
+    }
+
+    private static void RunUpdaterRoundTrip(string workDirectory, string extension)
+    {
+        string source = Path.Combine(workDirectory, "update-source" + extension);
+        string output = Path.Combine(workDirectory, "update-output" + extension);
+
+        using (var writer = ExcelWriter.CreateWriter(source))
+        {
+            writer.AddSheet("Data");
+            writer.WriteSheet(new object?[][]
+            {
+                ["Before", 1],
+                ["Before", 2]
+            }, headers: ["Name", "Value"]);
+        }
+
+        if (extension == ".xlsx")
+        {
+            using var updater = new XlsxUpdater(source);
+            updater.ReplaceSheetData("Data", new object?[][] { ["After", 3] },
+                new ReplaceSheetDataOptions { Headers = ["Name", "Value"] });
+            updater.Save(output);
+        }
+        else
+        {
+            using var updater = new XlsbUpdater(source);
+            updater.ReplaceSheetData("Data", new object?[][] { ["After", 3] },
+                new ReplaceSheetDataOptions { Headers = ["Name", "Value"] });
+            updater.Save(output);
+        }
+
+        using var reader = new XlsxOrXlsbReadOrEdit();
+        reader.Open(output);
+        reader.ActualSheetName = "Data";
+        Check(reader.Read(), $"Missing updater header row in {extension}.");
+        Check(reader.Read(), $"Missing updater data row in {extension}.");
+        Check(reader.GetString(0) == "After", $"Unexpected updater value in {extension}.");
+        Check(reader.GetInt32(1) == 3, $"Unexpected updater number in {extension}.");
     }
 
     private static void Check(bool condition, string message)

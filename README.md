@@ -18,7 +18,8 @@ without requiring Microsoft Excel.
   and `GetDateTime`.
 - Write from `DataTable`, `IDataReader`, object arrays or typed row lists.
 - Support multiple sheets, autofilters, hidden sheets and cell formatting.
-- Update existing XLSX sheets and pivot-table ranges.
+- Update existing `.xlsx` and `.xlsb` sheets while preserving the rest of the workbook.
+- Update worksheet-backed pivot-cache ranges and mark dependent pivot tables for refresh.
 - Targets `net8.0`, `net9.0` and `net10.0`.
 - NativeAOT and trimming analyzers enabled for the library.
 
@@ -87,6 +88,31 @@ using var writer = ExcelWriter.CreateWriter("products.xlsx");
 writer.AddSheet("Products");
 writer.WriteSheet(headers, types, rows, doAutofilter: true);
 ```
+
+### Update an existing XLSX or XLSB workbook
+
+Use `XlsxUpdater` for `.xlsx` and `XlsbUpdater` for `.xlsb`. The updater keeps
+the original package in memory, replaces only the selected worksheet data and
+related pivot-cache metadata, and does not require Microsoft Excel at runtime:
+
+```csharp
+using SpreadSheetTasks;
+
+var rows = new object?[][]
+{
+    ["Widget", 50000m],
+    ["Gadget", 75000m]
+};
+
+using var updater = new XlsxUpdater("report.xlsx"); // XlsbUpdater for .xlsb
+updater.ReplaceSheetData("Data", rows,
+    new ReplaceSheetDataOptions { Headers = ["Product", "Revenue"] });
+updater.Save("report-updated.xlsx");
+```
+
+`Save()` without an output path safely replaces the source file. `ToArray()`
+can be used when the updated package must be handled as bytes. Only `.xlsx`
+and `.xlsb` are supported by the updater API.
 
 ## NativeAOT and trimming
 

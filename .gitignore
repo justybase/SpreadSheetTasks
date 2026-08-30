@@ -388,4 +388,5 @@ FodyWeavers.xsd
 *.sln.iml
 *.xlsb
 *.xlsx
+/test_output/updater_pivot_*.json
 /source/TestFiles/testExcel.xlsx

@@ -26,15 +26,16 @@
    - [RowCount and ResultsCount](#rowcount-and-resultscount)
    - [TreatAllColumnsAsText](#treatallcolumnsastext)
    - [UseMemoryStreamInXlsb](#usememorystreaminxlsb)
-   - [Read in update mode (XLSX)](#read-in-update-mode-xlsx)
+   - [Read in update mode (legacy XLSX API)](#read-in-update-mode-legacy-xlsx-api)
    - [GetExcelDataType / GetNativeValue](#getexceldatatype--getnativevalue)
 4. [Factory method](#factory-method-excelwritercreatewriter)
-5. [Write to existing XLSX (advanced)](#write-to-existing-xlsx-advanced)
+5. [Update existing XLSX/XLSB workbooks](#update-existing-xlsxxlsb-workbooks)
+6. [Low-level existing XLSX writing](#low-level-existing-xlsx-writing)
    - [XlsxWriter.WriteToExisting](#xlsxwriterwritetoexisting)
    - [ReplaceSheetData + ReplacePivotTableDim](#replacesheetdata--replacepivottabledim)
-6. [Breaking Changes in v1.0.0](#breaking-changes-in-v100)
-7. [Format constants (F class)](#format-constants-f-class)
-8. [Performance and NativeAOT](performance-and-aot.md)
+7. [Breaking Changes in v1.0.0](#breaking-changes-in-v100)
+8. [Format constants (F class)](#format-constants-f-class)
+9. [Performance and NativeAOT](performance-and-aot.md)
 
 ---
 
@@ -503,7 +504,7 @@ using (var reader = new XlsxOrXlsbReadOrEdit())
 }
 ```
 
-### Read in update mode (XLSX only)
+### Read in update mode (legacy XLSX API)
 
 ```csharp
 using SpreadSheetTasks;
@@ -524,6 +525,9 @@ using (var reader = new XlsxOrXlsbReadOrEdit())
     Console.WriteLine($"Replaced range: {range}");
 }
 ```
+
+For replacement of existing workbooks, prefer `XlsxUpdater`/`XlsbUpdater`
+below. They preserve worksheet metadata and support both formats.
 
 ### GetExcelDataType / GetNativeValue
 
@@ -591,7 +595,64 @@ using (var writer = ExcelWriter.CreateWriter("data.xlsx"))
 
 ---
 
-## Write to existing XLSX (advanced)
+## Update existing XLSX/XLSB workbooks
+
+`XlsxUpdater` and `XlsbUpdater` replace the contents of one existing worksheet
+without rebuilding the workbook. Other worksheets and package parts remain
+untouched. The API is intentionally limited to `.xlsx` and `.xlsb`, which are
+the two formats supported by this library.
+
+```csharp
+using SpreadSheetTasks;
+using System.Data;
+
+var table = new DataTable();
+table.Columns.Add("Category", typeof(string));
+table.Columns.Add("Amount", typeof(decimal));
+table.Rows.Add("A", 100m);
+table.Rows.Add("B", 200m);
+
+using var updater = new XlsxUpdater("report.xlsx");
+updater.ReplaceSheetData("Data", table,
+    new ReplaceSheetDataOptions { Headers = ["Category", "Amount"] });
+updater.Save("report-updated.xlsx");
+```
+
+For a binary workbook use the same calls with `XlsbUpdater` and `.xlsb` paths:
+
+```csharp
+using var updater = new XlsbUpdater("report.xlsb");
+updater.ReplaceSheetData("Data", new object?[][]
+{
+    ["A", 100],
+    ["B", 200]
+}, new ReplaceSheetDataOptions { Headers = ["Category", "Amount"] });
+updater.Save("report-updated.xlsb");
+```
+
+The overloads accept `IDataReader`, `DataTable`, `object?[][]` and
+`IReadOnlyList<object?[]>`. `Headers` is optional; when supplied it becomes
+row 1 and the data starts at row 2. Without it, the supplied rows start at
+row 1. Trailing completely empty rows are omitted, while empty rows in the
+middle are retained. Existing column styles are reused where possible;
+`ReplaceSheetDataStyleFallback.General` selects the workbook's General style.
+
+When a pivot cache uses the replaced worksheet as its source, the updater also
+changes the source range and record count and marks the cache and dependent
+pivot table for refresh on opening in Excel. It does not require Excel or COM
+for normal operation. To validate generated files on Windows with Microsoft
+Excel installed, run:
+
+```powershell
+.\tools\Validate-ExcelCom.ps1 -Path .\report-updated.xlsx -RequireExcel
+```
+
+`Save()` with no path overwrites the source safely; `ToArray()` returns the
+complete updated package for callers that need byte-oriented output.
+
+---
+
+## Low-level existing XLSX writing
 
 ### XlsxWriter.WriteToExisting
 
