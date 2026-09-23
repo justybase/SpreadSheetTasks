@@ -12,6 +12,25 @@ namespace SpreadSheetTasks;
 /// </summary>
 public sealed class XlsxUpdater : IDisposable
 {
+    // Keep small imports in memory; staging them to disk only pays off above this measured break-even range.
+    private const int ReaderInMemoryRowLimit = 4_096;
+
+    private readonly record struct StreamedSheetData(int DataRowCount, int TotalRowCount, int LastColumnIndex);
+
+    private readonly record struct SharedStringsCheckpoint(
+        SharedStringsState? State,
+        int ValueCount,
+        int TotalCount,
+        int CommittedValueCount,
+        bool Dirty);
+
+    private readonly record struct XmlReplacement(
+        int Start,
+        int Length,
+        string? PrefixText,
+        string? FilePath,
+        string? SuffixText);
+
     private sealed class SharedStringsState
     {
         internal string Xml { get; set; } = string.Empty;
@@ -74,18 +93,30 @@ public sealed class XlsxUpdater : IDisposable
         return _sheetNames.ToArray();
     }
 
-    /// <summary>Replaces worksheet data read from an IDataReader.</summary>
+    /// <summary>
+    /// Replaces worksheet data read from an IDataReader. Larger inputs may be staged in the system
+    /// temporary directory to reduce peak managed-memory use.
+    /// </summary>
     public void ReplaceSheetData(string sheetName, IDataReader reader, ReplaceSheetDataOptions? options = null)
     {
         ArgumentNullException.ThrowIfNull(reader);
-        ReplaceSheetDataCore(sheetName, UpdaterRows.FromReader(reader, options), options);
+        ReplaceSheetDataFromReaderCore(sheetName, reader, options);
     }
 
-    /// <summary>Replaces worksheet data read from a DataTable.</summary>
+    /// <summary>
+    /// Replaces worksheet data read from a DataTable. Larger inputs may be staged in the system
+    /// temporary directory to reduce peak managed-memory use.
+    /// </summary>
     public void ReplaceSheetData(string sheetName, DataTable table, ReplaceSheetDataOptions? options = null)
     {
         ArgumentNullException.ThrowIfNull(table);
-        ReplaceSheetDataCore(sheetName, UpdaterRows.FromDataTable(table, options), options);
+        if (table.Rows.Count <= ReaderInMemoryRowLimit)
+        {
+            ReplaceSheetDataCore(sheetName, UpdaterRows.FromDataTable(table, options), options);
+            return;
+        }
+        using var reader = table.CreateDataReader();
+        ReplaceSheetData(sheetName, reader, options);
     }
 
     /// <summary>Replaces worksheet data supplied as a jagged array.</summary>
@@ -166,6 +197,318 @@ public sealed class XlsxUpdater : IDisposable
             : "A1";
         HashSet<string> affectedCacheIds = UpdatePivotCaches(sheetName, dimension, data.DataRowCount);
         UpdatePivotTables(affectedCacheIds);
+    }
+
+    private void ReplaceSheetDataFromReaderCore(string sheetName, IDataReader reader, ReplaceSheetDataOptions? options)
+    {
+        ThrowIfDisposed();
+        ArgumentNullException.ThrowIfNull(sheetName);
+        ArgumentException.ThrowIfNullOrWhiteSpace(sheetName);
+        UpdaterRows.ValidateHeaders(options?.Headers);
+
+        if (!_sheetNameToPath.TryGetValue(sheetName, out string? sheetPath))
+            throw new KeyNotFoundException($"XlsxUpdater: worksheet '{sheetName}' was not found.");
+
+        List<object?[]> initialRows = UpdaterRows.ReadReaderPrefix(reader, ReaderInMemoryRowLimit, out bool hasMore);
+        if (!hasMore)
+        {
+            ReplaceSheetDataCore(sheetName, UpdaterRows.FromRows(initialRows, options), options);
+            return;
+        }
+
+        ReplaceSheetDataFromLargeReaderCore(sheetName, sheetPath, reader, initialRows, options);
+    }
+
+    private void ReplaceSheetDataFromLargeReaderCore(
+        string sheetName,
+        string sheetPath,
+        IDataReader reader,
+        IReadOnlyList<object?[]> initialRows,
+        ReplaceSheetDataOptions? options)
+    {
+        string originalXml = Encoding.UTF8.GetString(_package.GetPart(sheetPath));
+        EnsureSharedStringsLoaded();
+        SharedStringsCheckpoint checkpoint = CaptureSharedStringsCheckpoint();
+
+        string rowsPath = CreateTemporaryPath(".sheet-data");
+        string? updatedSheetPath = CreateTemporaryPath(".worksheet");
+        bool worksheetStaged = false;
+        StreamedSheetData data = default;
+        try
+        {
+            if (_sharedStrings is not null)
+                _sharedStrings.TotalCount = Math.Max(0, _sharedStrings.TotalCount - CountSharedStringReferences(originalXml));
+
+            Dictionary<int, int> dataStyles = [];
+            Dictionary<int, int> headerStyles = [];
+            int? dateStyle = null;
+            if (options?.StyleFallback != ReplaceSheetDataStyleFallback.General)
+            {
+                (dataStyles, headerStyles) = CollectExistingStyles(originalXml);
+                dateStyle = FindDateStyleIndex();
+            }
+
+            Match sheetDataOpen = UpdaterXmlUtils.FindStartTag(originalXml, "sheetData");
+            string prefix = UpdaterXmlUtils.PrefixFromTag(sheetDataOpen);
+            data = WriteSheetDataFile(
+                reader, initialRows, options?.Headers, dataStyles, headerStyles, dateStyle, prefix, rowsPath);
+            PatchWorksheetXmlToFile(originalXml, rowsPath, updatedSheetPath, data);
+
+            _package.SetPartFromFile(sheetPath, updatedSheetPath);
+            worksheetStaged = true;
+            updatedSheetPath = null;
+        }
+        catch
+        {
+            if (!worksheetStaged)
+                RestoreSharedStringsCheckpoint(checkpoint);
+            throw;
+        }
+        finally
+        {
+            DeleteTemporaryFile(rowsPath);
+            if (updatedSheetPath is not null)
+                DeleteTemporaryFile(updatedSheetPath);
+        }
+
+        CommitSharedStrings();
+
+        string dimension = data.TotalRowCount > 0 && data.LastColumnIndex >= 0
+            ? $"A1:{UpdaterXmlUtils.ColumnToLetters(data.LastColumnIndex)}{data.TotalRowCount}"
+            : "A1";
+        HashSet<string> affectedCacheIds = UpdatePivotCaches(sheetName, dimension, data.DataRowCount);
+        UpdatePivotTables(affectedCacheIds);
+    }
+
+    private StreamedSheetData WriteSheetDataFile(
+        IDataReader reader,
+        IReadOnlyList<object?[]> initialRows,
+        IReadOnlyList<string>? headers,
+        IReadOnlyDictionary<int, int> dataStyles,
+        IReadOnlyDictionary<int, int> headerStyles,
+        int? dateStyle,
+        string prefix,
+        string path)
+    {
+        using var output = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+            bufferSize: 1024 * 1024, FileOptions.SequentialScan);
+        using var writer = new StreamWriter(output, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false), 65_536);
+
+        int rowNumber = 1;
+        int dataRowCount = 0;
+        int totalRowCount = 0;
+        int lastColumnIndex = -1;
+        int pendingEmptyRows = 0;
+
+        if (headers is not null)
+        {
+            WriteRowStart(writer, prefix, rowNumber);
+            for (int column = 0; column < headers.Count; column++)
+                writer.Write(BuildStringCell(headers[column], column, rowNumber, headerStyles.GetValueOrDefault(column), prefix));
+            WriteRowEnd(writer, prefix);
+            lastColumnIndex = headers.Count - 1;
+            rowNumber++;
+            totalRowCount++;
+        }
+
+        int fieldCount = reader.FieldCount;
+        void WriteDataRow(object?[] rowValues)
+        {
+            if (UpdaterRows.IsEmptyRow(rowValues))
+            {
+                pendingEmptyRows++;
+                return;
+            }
+
+            while (pendingEmptyRows > 0)
+            {
+                WriteEmptyRow(writer, prefix, rowNumber++);
+                pendingEmptyRows--;
+                dataRowCount++;
+                totalRowCount++;
+                lastColumnIndex = Math.Max(lastColumnIndex, fieldCount - 1);
+            }
+
+            WriteRowStart(writer, prefix, rowNumber);
+            for (int column = 0; column < fieldCount; column++)
+            {
+                object? value = UpdaterRows.Unwrap(rowValues[column]);
+                if (UpdaterRows.IsEmpty(value))
+                    continue;
+                writer.Write(BuildValueCell(value!, column, rowNumber, dataStyles.GetValueOrDefault(column), dateStyle, prefix));
+            }
+            WriteRowEnd(writer, prefix);
+            rowNumber++;
+            dataRowCount++;
+            totalRowCount++;
+            lastColumnIndex = Math.Max(lastColumnIndex, fieldCount - 1);
+        }
+
+        foreach (object?[] initialRow in initialRows)
+            WriteDataRow(initialRow);
+
+        var row = new object?[fieldCount];
+        while (reader.Read())
+        {
+            for (int column = 0; column < fieldCount; column++)
+            {
+                object value = reader.GetValue(column);
+                row[column] = value == DBNull.Value ? null : value;
+            }
+            WriteDataRow(row);
+        }
+
+        writer.Flush();
+        return new StreamedSheetData(dataRowCount, totalRowCount, lastColumnIndex);
+    }
+
+    private static void WriteRowStart(TextWriter writer, string prefix, int rowNumber)
+    {
+        writer.Write('<');
+        writer.Write(prefix);
+        writer.Write("row r=\"");
+        writer.Write(rowNumber.ToString(CultureInfo.InvariantCulture));
+        writer.Write("\">");
+    }
+
+    private static void WriteRowEnd(TextWriter writer, string prefix)
+    {
+        writer.Write("</");
+        writer.Write(prefix);
+        writer.Write("row>");
+    }
+
+    private static void WriteEmptyRow(TextWriter writer, string prefix, int rowNumber)
+    {
+        WriteRowStart(writer, prefix, rowNumber);
+        WriteRowEnd(writer, prefix);
+    }
+
+    private void PatchWorksheetXmlToFile(string xml, string sheetDataPath, string outputPath, StreamedSheetData data)
+    {
+        string dimension = data.TotalRowCount > 0 && data.LastColumnIndex >= 0
+            ? $"A1:{UpdaterXmlUtils.ColumnToLetters(data.LastColumnIndex)}{data.TotalRowCount}"
+            : "A1";
+        Match root = UpdaterXmlUtils.FindStartTag(xml, "worksheet");
+        Match? dimensionTag = FindOptionalStartTag(xml, "dimension");
+        Match sheetDataOpen = UpdaterXmlUtils.FindStartTag(xml, "sheetData");
+        string prefix = UpdaterXmlUtils.PrefixFromTag(sheetDataOpen);
+        string closeTag = $"</{prefix}sheetData>";
+        var replacements = new List<XmlReplacement>(3);
+
+        if (dimensionTag is not null)
+        {
+            string replacement = UpdaterXmlUtils.ReplaceTagAttribute(dimensionTag.Value, "ref", dimension);
+            replacements.Add(new XmlReplacement(dimensionTag.Index, dimensionTag.Length, replacement, null, null));
+        }
+        else
+        {
+            string rootPrefix = UpdaterXmlUtils.PrefixFromTag(root);
+            string replacement = $"<{rootPrefix}dimension ref=\"{dimension}\"/>";
+            replacements.Add(new XmlReplacement(root.Index + root.Length, 0, replacement, null, null));
+        }
+
+        string openTag = sheetDataOpen.Value;
+        if (openTag.TrimEnd().EndsWith("/>", StringComparison.Ordinal))
+        {
+            string expandedOpenTag = openTag.TrimEnd()[..^2] + ">";
+            replacements.Add(new XmlReplacement(
+                sheetDataOpen.Index,
+                sheetDataOpen.Length,
+                expandedOpenTag,
+                sheetDataPath,
+                closeTag));
+        }
+        else
+        {
+            int contentStart = sheetDataOpen.Index + sheetDataOpen.Length;
+            int contentEnd = xml.IndexOf(closeTag, contentStart, StringComparison.Ordinal);
+            if (contentEnd < 0)
+                throw new InvalidDataException("The XLSX worksheet sheetData element is not closed.");
+            replacements.Add(new XmlReplacement(contentStart, contentEnd - contentStart, string.Empty, sheetDataPath, string.Empty));
+        }
+
+        Match? autoFilter = FindOptionalStartTag(xml, "autoFilter");
+        if (autoFilter is not null)
+        {
+            string replacement = UpdaterXmlUtils.ReplaceTagAttribute(autoFilter.Value, "ref", dimension);
+            replacements.Add(new XmlReplacement(autoFilter.Index, autoFilter.Length, replacement, null, null));
+        }
+
+        replacements.Sort(static (left, right) => left.Start.CompareTo(right.Start));
+        using var destination = new FileStream(outputPath, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+            bufferSize: 1024 * 1024, FileOptions.SequentialScan);
+        using var writer = new StreamWriter(destination, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false), 65_536);
+        int position = 0;
+        foreach (XmlReplacement replacement in replacements)
+        {
+            if (replacement.Start < position)
+                throw new InvalidDataException("Overlapping worksheet XML replacements were detected.");
+
+            writer.Write(xml.AsSpan(position, replacement.Start - position));
+            if (replacement.PrefixText is not null)
+                writer.Write(replacement.PrefixText);
+            if (replacement.FilePath is not null)
+            {
+                writer.Flush();
+                using var input = new FileStream(replacement.FilePath, FileMode.Open, FileAccess.Read, FileShare.Read,
+                    bufferSize: 1024 * 1024, FileOptions.SequentialScan);
+                input.CopyTo(destination, 1024 * 1024);
+            }
+            if (replacement.SuffixText is not null)
+                writer.Write(replacement.SuffixText);
+            position = replacement.Start + replacement.Length;
+        }
+        writer.Write(xml.AsSpan(position));
+    }
+
+    private SharedStringsCheckpoint CaptureSharedStringsCheckpoint()
+    {
+        if (_sharedStrings is null)
+            return default;
+
+        return new SharedStringsCheckpoint(
+            _sharedStrings,
+            _sharedStrings.Values.Count,
+            _sharedStrings.TotalCount,
+            _sharedStrings.CommittedValueCount,
+            _sharedStrings.Dirty);
+    }
+
+    private void RestoreSharedStringsCheckpoint(SharedStringsCheckpoint checkpoint)
+    {
+        if (checkpoint.State is null)
+        {
+            _sharedStrings = null;
+            return;
+        }
+
+        SharedStringsState state = checkpoint.State;
+        for (int i = state.Values.Count - 1; i >= checkpoint.ValueCount; i--)
+            state.Index.Remove(state.Values[i]);
+        if (state.Values.Count > checkpoint.ValueCount)
+            state.Values.RemoveRange(checkpoint.ValueCount, state.Values.Count - checkpoint.ValueCount);
+        state.TotalCount = checkpoint.TotalCount;
+        state.CommittedValueCount = checkpoint.CommittedValueCount;
+        state.Dirty = checkpoint.Dirty;
+        _sharedStrings = state;
+    }
+
+    private static string CreateTemporaryPath(string suffix)
+    {
+        return Path.Combine(Path.GetTempPath(), $"SpreadSheetTasks-{Guid.NewGuid():N}{suffix}");
+    }
+
+    private static void DeleteTemporaryFile(string path)
+    {
+        try
+        {
+            File.Delete(path);
+        }
+        catch (FileNotFoundException)
+        {
+            // A failed staging operation may already have removed the file.
+        }
     }
 
     private void LoadWorkbookStructure()
@@ -436,7 +779,7 @@ public sealed class XlsxUpdater : IDisposable
                 object? value = UpdaterRows.Unwrap(row[column]);
                 if (UpdaterRows.IsEmpty(value))
                     continue;
-                builder.Append(BuildValueCell(value, column, rowNumber, dataStyles.GetValueOrDefault(column), dateStyle, string.Empty));
+                builder.Append(BuildValueCell(value!, column, rowNumber, dataStyles.GetValueOrDefault(column), dateStyle, string.Empty));
             }
             builder.Append("</row>");
             rowNumber++;
@@ -460,7 +803,7 @@ public sealed class XlsxUpdater : IDisposable
                 {
                     int dateCellStyle = style > 0 ? style : dateStyle ?? 0;
                     string dateStyleAttribute = dateCellStyle > 0 ? $" s=\"{dateCellStyle}\"" : string.Empty;
-                    return $"<c r=\"{reference}\"{dateStyleAttribute}><v>{serial.ToString("R", CultureInfo.InvariantCulture)}</v></c>";
+                    return $"<{prefix}c r=\"{reference}\"{dateStyleAttribute}><{prefix}v>{serial.ToString("R", CultureInfo.InvariantCulture)}</{prefix}v></{prefix}c>";
                 }
             }
             catch (ArgumentException)
@@ -474,12 +817,12 @@ public sealed class XlsxUpdater : IDisposable
             return BuildValueCell(dateTimeOffset.DateTime, column, row, style, dateStyle, prefix);
 
         if (value is bool boolean)
-            return $"<c r=\"{reference}\" t=\"b\"{styleAttribute}><v>{(boolean ? 1 : 0)}</v></c>";
+            return $"<{prefix}c r=\"{reference}\" t=\"b\"{styleAttribute}><{prefix}v>{(boolean ? 1 : 0)}</{prefix}v></{prefix}c>";
 
         if (TryConvertNumber(value, out double number))
         {
             if (double.IsFinite(number))
-                return $"<c r=\"{reference}\"{styleAttribute}><v>{number.ToString("R", CultureInfo.InvariantCulture)}</v></c>";
+                return $"<{prefix}c r=\"{reference}\"{styleAttribute}><{prefix}v>{number.ToString("R", CultureInfo.InvariantCulture)}</{prefix}v></{prefix}c>";
             return BuildStringCell(number.ToString(CultureInfo.InvariantCulture), column, row, style, prefix);
         }
 

@@ -53,6 +53,34 @@ internal sealed class UpdaterRows
         return Create(rows, options?.Headers);
     }
 
+    internal static UpdaterRows FromRows(List<object?[]> rows, ReplaceSheetDataOptions? options)
+    {
+        ArgumentNullException.ThrowIfNull(rows);
+        return Create(rows, options?.Headers);
+    }
+
+    internal static List<object?[]> ReadReaderPrefix(IDataReader reader, int maximumRows, out bool hasMore)
+    {
+        ArgumentNullException.ThrowIfNull(reader);
+        ArgumentOutOfRangeException.ThrowIfNegative(maximumRows);
+
+        int fieldCount = reader.FieldCount;
+        var rows = new List<object?[]>();
+        while (rows.Count <= maximumRows && reader.Read())
+        {
+            var row = new object?[fieldCount];
+            for (int column = 0; column < fieldCount; column++)
+            {
+                object value = reader.GetValue(column);
+                row[column] = value == DBNull.Value ? null : value;
+            }
+            rows.Add(row);
+        }
+
+        hasMore = rows.Count > maximumRows;
+        return rows;
+    }
+
     internal static UpdaterRows FromDataTable(DataTable table, ReplaceSheetDataOptions? options)
     {
         ArgumentNullException.ThrowIfNull(table);
@@ -110,13 +138,22 @@ internal sealed class UpdaterRows
         return value is null || value == DBNull.Value;
     }
 
-    private static bool IsEmptyRow(object?[] row)
+    internal static bool IsEmptyRow(IReadOnlyList<object?> row)
     {
-        foreach (object? value in row)
+        for (int i = 0; i < row.Count; i++)
         {
-            if (!IsEmpty(value))
+            if (!IsEmpty(row[i]))
                 return false;
         }
         return true;
+    }
+
+    internal static void ValidateHeaders(IReadOnlyList<string>? headers)
+    {
+        if (headers is null)
+            return;
+
+        for (int i = 0; i < headers.Count; i++)
+            ArgumentNullException.ThrowIfNull(headers[i]);
     }
 }

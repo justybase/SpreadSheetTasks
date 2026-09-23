@@ -16,8 +16,70 @@ internal sealed class UpdaterPackage : IDisposable
             Data = data;
         }
 
+        internal Part(string name, string filePath)
+        {
+            Name = name;
+            FilePath = filePath;
+            Data = [];
+        }
+
         internal string Name { get; }
-        internal byte[] Data { get; set; }
+        internal byte[] Data { get; private set; }
+        internal string? FilePath { get; private set; }
+        internal long Length => FilePath is null ? Data.LongLength : new FileInfo(FilePath).Length;
+
+        internal byte[] ReadAll()
+        {
+            return FilePath is null ? Data.ToArray() : File.ReadAllBytes(FilePath);
+        }
+
+        internal void CopyTo(Stream destination)
+        {
+            if (FilePath is null)
+            {
+                destination.Write(Data, 0, Data.Length);
+                return;
+            }
+
+            using var input = new FileStream(FilePath, FileMode.Open, FileAccess.Read, FileShare.Read,
+                bufferSize: 1024 * 1024, FileOptions.SequentialScan);
+            input.CopyTo(destination, 1024 * 1024);
+        }
+
+        internal void SetBytes(byte[] data)
+        {
+            DeleteStagedFile();
+            Data = data.ToArray();
+        }
+
+        internal void SetFile(string filePath)
+        {
+            if (!string.Equals(FilePath, filePath, StringComparison.Ordinal))
+                DeleteStagedFile();
+            FilePath = filePath;
+            Data = [];
+        }
+
+        internal void Dispose()
+        {
+            DeleteStagedFile();
+        }
+
+        private void DeleteStagedFile()
+        {
+            if (FilePath is null)
+                return;
+
+            try
+            {
+                File.Delete(FilePath);
+            }
+            catch (FileNotFoundException)
+            {
+                // The caller may already have removed a failed staging file.
+            }
+            FilePath = null;
+        }
     }
 
     private readonly string _sourcePath;
@@ -88,7 +150,7 @@ internal sealed class UpdaterPackage : IDisposable
     internal byte[]? TryGetPart(string name)
     {
         ThrowIfDisposed();
-        return _lookup.TryGetValue(name, out var part) ? part.Data.ToArray() : null;
+        return _lookup.TryGetValue(name, out var part) ? part.ReadAll() : null;
     }
 
     internal byte[] GetPart(string name)
@@ -104,11 +166,35 @@ internal sealed class UpdaterPackage : IDisposable
 
         if (_lookup.TryGetValue(name, out var existing))
         {
-            existing.Data = data.ToArray();
+            existing.SetBytes(data);
             return;
         }
 
         AddPart(name, data);
+    }
+
+    /// <summary>
+    /// Replaces a part with a staged file. Ownership of the file transfers to
+    /// this package; it remains available for repeated saves and is removed on
+    /// replacement or disposal.
+    /// </summary>
+    internal void SetPartFromFile(string name, string filePath)
+    {
+        ThrowIfDisposed();
+        ArgumentNullException.ThrowIfNull(name);
+        ArgumentException.ThrowIfNullOrWhiteSpace(filePath);
+        if (!File.Exists(filePath))
+            throw new FileNotFoundException("Staged ZIP part was not found.", filePath);
+
+        if (_lookup.TryGetValue(name, out var existing))
+        {
+            existing.SetFile(filePath);
+            return;
+        }
+
+        var part = new Part(name, filePath);
+        _parts.Add(part);
+        _lookup[name] = part;
     }
 
     internal byte[] ToArray()
@@ -121,7 +207,7 @@ internal sealed class UpdaterPackage : IDisposable
             {
                 var entry = archive.CreateEntry(part.Name, CompressionLevel.Optimal);
                 using var destination = entry.Open();
-                destination.Write(part.Data, 0, part.Data.Length);
+                part.CopyTo(destination);
             }
         }
         return output.ToArray();
@@ -139,7 +225,25 @@ internal sealed class UpdaterPackage : IDisposable
         string temporary = Path.Combine(directory, $".{Path.GetFileName(target)}.{Guid.NewGuid():N}.tmp");
         try
         {
-            File.WriteAllBytes(temporary, ToArray());
+            long uncompressedLength = 0;
+            foreach (Part part in _parts)
+            {
+                uncompressedLength = Math.Min(1024L * 1024, uncompressedLength + part.Length);
+                if (uncompressedLength >= 1024L * 1024)
+                    break;
+            }
+            int bufferSize = uncompressedLength >= 1024L * 1024 ? 1024 * 1024 : 64 * 1024;
+            using (var output = new FileStream(temporary, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None,
+                bufferSize, FileOptions.SequentialScan))
+            using (var archive = new ZipArchive(output, ZipArchiveMode.Create, leaveOpen: false))
+            {
+                foreach (var part in _parts)
+                {
+                    var entry = archive.CreateEntry(part.Name, CompressionLevel.Optimal);
+                    using var destination = entry.Open();
+                    part.CopyTo(destination);
+                }
+            }
             File.Move(temporary, target, overwrite: true);
         }
         finally
@@ -154,6 +258,8 @@ internal sealed class UpdaterPackage : IDisposable
         if (_disposed)
             return;
         _disposed = true;
+        foreach (var part in _parts)
+            part.Dispose();
         _parts.Clear();
         _lookup.Clear();
     }

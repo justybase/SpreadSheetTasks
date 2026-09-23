@@ -12,6 +12,18 @@ namespace SpreadSheetTasks;
 /// </summary>
 public sealed class XlsbUpdater : IDisposable
 {
+    // Avoid staging overhead for small readers; measurements show the balance changes around 16K rows.
+    private const int ReaderInMemoryRowLimit = 16_384;
+
+    private readonly record struct SharedStringsCheckpoint(
+        Biff12UpdaterUtils.SharedStringsState? State,
+        int ValueCount,
+        uint TotalCount,
+        uint UniqueCount,
+        int EndSstOffset,
+        int CommittedValueCount,
+        bool Dirty);
+
     private static readonly HashSet<uint> CellRecordIds =
     [0x0001, 0x0002, 0x0003, 0x0004, 0x0005, 0x0006, 0x0007, 0x0008, 0x0009, 0x000A, 0x000B];
 
@@ -68,18 +80,30 @@ public sealed class XlsbUpdater : IDisposable
         return _sheetNames.ToArray();
     }
 
-    /// <summary>Replaces worksheet data read from an IDataReader.</summary>
+    /// <summary>
+    /// Replaces worksheet data read from an IDataReader. Larger inputs may be staged in the system
+    /// temporary directory to reduce peak managed-memory use.
+    /// </summary>
     public void ReplaceSheetData(string sheetName, IDataReader reader, ReplaceSheetDataOptions? options = null)
     {
         ArgumentNullException.ThrowIfNull(reader);
-        ReplaceSheetDataCore(sheetName, UpdaterRows.FromReader(reader, options), options);
+        ReplaceSheetDataFromReaderCore(sheetName, reader, options);
     }
 
-    /// <summary>Replaces worksheet data read from a DataTable.</summary>
+    /// <summary>
+    /// Replaces worksheet data read from a DataTable. Larger inputs may be staged in the system
+    /// temporary directory to reduce peak managed-memory use.
+    /// </summary>
     public void ReplaceSheetData(string sheetName, DataTable table, ReplaceSheetDataOptions? options = null)
     {
         ArgumentNullException.ThrowIfNull(table);
-        ReplaceSheetDataCore(sheetName, UpdaterRows.FromDataTable(table, options), options);
+        if (table.Rows.Count <= ReaderInMemoryRowLimit)
+        {
+            ReplaceSheetDataCore(sheetName, UpdaterRows.FromDataTable(table, options), options);
+            return;
+        }
+        using var reader = table.CreateDataReader();
+        ReplaceSheetData(sheetName, reader, options);
     }
 
     /// <summary>Replaces worksheet data supplied as a jagged array.</summary>
@@ -171,6 +195,250 @@ public sealed class XlsbUpdater : IDisposable
 
         CommitSharedStrings();
         PatchPivotCaches(sheetName, lastRow, lastColumn);
+    }
+
+    private void ReplaceSheetDataFromReaderCore(string sheetName, IDataReader reader, ReplaceSheetDataOptions? options)
+    {
+        ThrowIfDisposed();
+        ArgumentNullException.ThrowIfNull(sheetName);
+        ArgumentException.ThrowIfNullOrWhiteSpace(sheetName);
+        UpdaterRows.ValidateHeaders(options?.Headers);
+
+        if (!_sheetNameToPath.TryGetValue(sheetName, out string? sheetPath))
+            throw new KeyNotFoundException($"XlsbUpdater: worksheet '{sheetName}' was not found.");
+
+        List<object?[]> initialRows = UpdaterRows.ReadReaderPrefix(reader, ReaderInMemoryRowLimit, out bool hasMore);
+        if (!hasMore)
+        {
+            ReplaceSheetDataCore(sheetName, UpdaterRows.FromRows(initialRows, options), options);
+            return;
+        }
+
+        ReplaceSheetDataFromLargeReaderCore(sheetName, sheetPath, reader, initialRows, options);
+    }
+
+    private void ReplaceSheetDataFromLargeReaderCore(
+        string sheetName,
+        string sheetPath,
+        IDataReader reader,
+        IReadOnlyList<object?[]> initialRows,
+        ReplaceSheetDataOptions? options)
+    {
+        byte[] originalSheet = _package.GetPart(sheetPath);
+        EnsureSharedStringsLoaded();
+        SharedStringsCheckpoint checkpoint = CaptureSharedStringsCheckpoint();
+        string rowsPath = CreateTemporaryPath(".sheet-rows");
+        string? updatedSheetPath = CreateTemporaryPath(".worksheet-bin");
+        bool worksheetStaged = false;
+        StreamedSheetData data = default;
+        try
+        {
+            if (_sharedStrings is not null)
+            {
+                _sharedStrings.TotalCount = (uint)Math.Max(
+                    0,
+                    (long)_sharedStrings.TotalCount - CountSharedStringReferences(originalSheet));
+            }
+
+            Dictionary<int, int> dataStyles = [];
+            Dictionary<int, int> headerStyles = [];
+            int? dateStyle = null;
+            if (options?.StyleFallback != ReplaceSheetDataStyleFallback.General)
+            {
+                (dataStyles, headerStyles) = CollectExistingStyles(originalSheet);
+                dateStyle = FindDateStyleIndex();
+            }
+
+            data = WriteRowsFile(reader, initialRows, options?.Headers, dataStyles, headerStyles, dateStyle, rowsPath);
+            RowRegion region = FindRowsRegion(originalSheet);
+            PatchDimension(originalSheet, data.TotalRowCount == 0 ? 0 : data.TotalRowCount - 1,
+                Math.Max(0, data.LastColumnIndex));
+            WriteUpdatedSheetFile(originalSheet, region, rowsPath, updatedSheetPath);
+            PatchAutoFilterRanges(updatedSheetPath, region, new FileInfo(rowsPath).Length,
+                region.RowsEnd - region.RowsStart, data.TotalRowCount == 0 ? 0 : data.TotalRowCount - 1,
+                Math.Max(0, data.LastColumnIndex));
+
+            _package.SetPartFromFile(sheetPath, updatedSheetPath);
+            worksheetStaged = true;
+            updatedSheetPath = null;
+        }
+        catch
+        {
+            if (!worksheetStaged)
+                RestoreSharedStringsCheckpoint(checkpoint);
+            throw;
+        }
+        finally
+        {
+            DeleteTemporaryFile(rowsPath);
+            if (updatedSheetPath is not null)
+                DeleteTemporaryFile(updatedSheetPath);
+        }
+
+        int lastRow = data.TotalRowCount == 0 ? 0 : data.TotalRowCount - 1;
+        int lastColumn = Math.Max(0, data.LastColumnIndex);
+        CommitSharedStrings();
+        PatchPivotCaches(sheetName, lastRow, lastColumn);
+    }
+
+    private readonly record struct StreamedSheetData(int DataRowCount, int TotalRowCount, int LastColumnIndex);
+
+    private StreamedSheetData WriteRowsFile(
+        IDataReader reader,
+        IReadOnlyList<object?[]> initialRows,
+        IReadOnlyList<string>? headers,
+        IReadOnlyDictionary<int, int> dataStyles,
+        IReadOnlyDictionary<int, int> headerStyles,
+        int? dateStyle,
+        string path)
+    {
+        using var output = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+            bufferSize: 1024 * 1024, FileOptions.SequentialScan);
+
+        int rowNumber = 0;
+        int dataRowCount = 0;
+        int totalRowCount = 0;
+        int lastColumnIndex = (headers?.Count ?? 0) - 1;
+        int pendingEmptyRows = 0;
+        if (headers is not null)
+        {
+            object?[] headerValues = new object?[headers.Count];
+            for (int column = 0; column < headers.Count; column++)
+                headerValues[column] = headers[column];
+            WriteRow(output, rowNumber++, headerValues, Math.Max(0, headers.Count - 1), headerStyles,
+                dateStyle: null, isHeader: true);
+            totalRowCount++;
+        }
+
+        int fieldCount = reader.FieldCount;
+        void WriteDataRow(object?[] rowValues)
+        {
+            if (UpdaterRows.IsEmptyRow(rowValues))
+            {
+                pendingEmptyRows++;
+                return;
+            }
+
+            while (pendingEmptyRows > 0)
+            {
+                WriteRow(output, rowNumber++, Array.Empty<object?>(), Math.Max(0, fieldCount - 1),
+                    dataStyles, dateStyle, isHeader: false);
+                pendingEmptyRows--;
+                dataRowCount++;
+                totalRowCount++;
+                lastColumnIndex = Math.Max(lastColumnIndex, fieldCount - 1);
+            }
+
+            WriteRow(output, rowNumber++, rowValues, Math.Max(0, fieldCount - 1), dataStyles, dateStyle, isHeader: false);
+            dataRowCount++;
+            totalRowCount++;
+            lastColumnIndex = Math.Max(lastColumnIndex, fieldCount - 1);
+        }
+
+        foreach (object?[] rowValues in initialRows)
+            WriteDataRow(rowValues);
+
+        var row = new object?[fieldCount];
+        while (reader.Read())
+        {
+            for (int column = 0; column < fieldCount; column++)
+            {
+                object value = reader.GetValue(column);
+                row[column] = value == DBNull.Value ? null : value;
+            }
+            WriteDataRow(row);
+        }
+
+        return new StreamedSheetData(dataRowCount, totalRowCount, lastColumnIndex);
+    }
+
+    private static void WriteUpdatedSheetFile(byte[] originalSheet, RowRegion region, string rowsPath, string outputPath)
+    {
+        using var output = new FileStream(outputPath, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+            bufferSize: 1024 * 1024, FileOptions.SequentialScan);
+        output.Write(originalSheet, 0, region.RowsStart);
+        using (var rows = new FileStream(rowsPath, FileMode.Open, FileAccess.Read, FileShare.Read,
+            bufferSize: 1024 * 1024, FileOptions.SequentialScan))
+        {
+            rows.CopyTo(output, 1024 * 1024);
+        }
+        output.Write(originalSheet, region.RowsEnd, originalSheet.Length - region.RowsEnd);
+    }
+
+    private static void PatchAutoFilterRanges(
+        string sheetPath,
+        RowRegion region,
+        long replacementLength,
+        int originalLength,
+        int lastRow,
+        int lastColumn)
+    {
+        long delta = replacementLength - originalLength;
+        using var sheet = new FileStream(sheetPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+        Span<byte> value = stackalloc byte[sizeof(int)];
+        foreach (int originalOffset in region.AutoFilterPayloadOffsets)
+        {
+            long offset = originalOffset >= region.RowsEnd ? originalOffset + delta : originalOffset;
+            if (offset < 0 || offset > sheet.Length - 16)
+                continue;
+            BinaryPrimitives.WriteInt32LittleEndian(value, lastRow);
+            sheet.Position = offset + 4;
+            sheet.Write(value);
+            BinaryPrimitives.WriteInt32LittleEndian(value, lastColumn);
+            sheet.Position = offset + 12;
+            sheet.Write(value);
+        }
+    }
+
+    private SharedStringsCheckpoint CaptureSharedStringsCheckpoint()
+    {
+        if (_sharedStrings is null)
+            return default;
+        return new SharedStringsCheckpoint(
+            _sharedStrings,
+            _sharedStrings.Values.Count,
+            _sharedStrings.TotalCount,
+            _sharedStrings.UniqueCount,
+            _sharedStrings.EndSstOffset,
+            _sharedStrings.CommittedValueCount,
+            _sharedStrings.Dirty);
+    }
+
+    private void RestoreSharedStringsCheckpoint(SharedStringsCheckpoint checkpoint)
+    {
+        if (checkpoint.State is null)
+        {
+            _sharedStrings = null;
+            return;
+        }
+
+        Biff12UpdaterUtils.SharedStringsState state = checkpoint.State;
+        for (int i = state.Values.Count - 1; i >= checkpoint.ValueCount; i--)
+            state.Index.Remove(state.Values[i]);
+        if (state.Values.Count > checkpoint.ValueCount)
+            state.Values.RemoveRange(checkpoint.ValueCount, state.Values.Count - checkpoint.ValueCount);
+        state.TotalCount = checkpoint.TotalCount;
+        state.UniqueCount = checkpoint.UniqueCount;
+        state.EndSstOffset = checkpoint.EndSstOffset;
+        state.CommittedValueCount = checkpoint.CommittedValueCount;
+        state.Dirty = checkpoint.Dirty;
+        _sharedStrings = state;
+    }
+
+    private static string CreateTemporaryPath(string suffix)
+    {
+        return Path.Combine(Path.GetTempPath(), $"SpreadSheetTasks-{Guid.NewGuid():N}{suffix}");
+    }
+
+    private static void DeleteTemporaryFile(string path)
+    {
+        try
+        {
+            File.Delete(path);
+        }
+        catch (FileNotFoundException)
+        {
+        }
     }
 
     private void LoadWorkbookStructure()
