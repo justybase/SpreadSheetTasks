@@ -9,6 +9,7 @@
    - [Write from string array](#write-from-string-array)
    - [Write from object\[\]\[\]](#write-from-object)
    - [Write with per-cell formatting (FormattedCell\[\]\[\])](#write-with-per-cell-formatting-formattedcell)
+   - [Cell styles](#cell-styles)
    - [Multi-sheet write](#multi-sheet-write)
    - [Write with Autofilter](#write-with-autofilter)
    - [Write with formatted cells](#write-with-formatted-cells)
@@ -46,7 +47,7 @@ dotnet add package SpreadSheetTasks
 ```
 
 ```xml
-<PackageReference Include="SpreadSheetTasks" Version="1.0.1" />
+<PackageReference Include="SpreadSheetTasks" Version="1.1.0" />
 ```
 
 ## Performance and NativeAOT
@@ -144,24 +145,68 @@ using (var writer = new XlsxWriter("products.xlsx"))
 ```csharp
 using SpreadSheetTasks;
 
-var rows = new object[][]
+var rows = new FormattedCell?[][]
 {
-    new object[] { 1234567, 1234.56 },
-    new object[] { 0.25, 12345.67 },
-};
-
-var formats = new FormattedCell[][]
-{
-    new FormattedCell[] { new(1234567, F.THOUSANDS_SEP), new(1234.56, F.CURRENCY_PLN) },
-    new FormattedCell[] { new(0.25, F.PERCENTAGE), new(12345.67, F.SCIENTIFIC) },
+    new FormattedCell?[] { new(1234567, F.THOUSANDS_SEP), new(1234.56, F.CURRENCY_PLN) },
+    new FormattedCell?[] { new(0.25, F.PERCENTAGE), new(12345.67, F.SCIENTIFIC) },
 };
 
 using (var writer = new XlsxWriter("formatted.xlsx"))
 {
     writer.AddSheet("Sheet1");
-    writer.WriteSheet(rows, headers: new[] { "Label", "Value" }, formats: formats);
+    writer.WriteSheet(rows, headers: new[] { "Count", "Value" });
 }
 ```
+
+### Cell styles
+
+Use `CellStyle` with `headerStyle` to format the first written row, and `styles`
+to style arbitrary absolute A1 cells or rectangular ranges. Both `XlsxWriter`
+and `XlsbWriter` support solid fill and font colors, bold, italic, underline
+and number formats. Alignment and text wrapping are supported by XLSX; XLSB
+throws `NotSupportedException` if those properties are requested.
+
+```csharp
+using SpreadSheetTasks;
+using System.Data;
+
+var table = new DataTable();
+table.Columns.Add("Product", typeof(string));
+table.Columns.Add("Quantity", typeof(int));
+table.Columns.Add("Comment", typeof(string));
+table.Rows.Add("Apples", 1200, "Restock soon");
+table.Rows.Add("Pears", 8, "Fresh");
+
+var header = new CellStyle { Fill = "#008000", FontColor = "#FFFFFF" };
+var warning = new CellStyle { Fill = "FFF2CC", NumberFormat = F.THOUSANDS_SEP };
+var note = new CellStyle { Fill = "FF0000", FontColor = "FFFFFF", Horizontal = "center", Wrap = true };
+
+using var writer = new XlsxWriter("styled.xlsx"); // CellStyle also works with XlsbWriter
+writer.AddSheet("Data");
+writer.WriteSheet(table.CreateDataReader(),
+    headerStyle: header,
+    styles: new Dictionary<string, CellStyle>
+    {
+        ["B2:B3"] = warning,
+        ["C2"] = note,
+    });
+```
+
+`CellStyle` properties are `Fill`, `FontColor`, `Bold`, `Italic`, `Underline`,
+`NumberFormat`, `Horizontal`, `Vertical` and `Wrap`. Colors are six-digit RGB
+hex strings, with or without `#`. A `null` property means "leave unchanged";
+overlapping ranges therefore compose, and later ranges override only the
+properties they specify. A cell's `FormattedCell.Format` takes precedence over
+`CellStyle.NumberFormat`. A header style is merged with the default bold header
+style (set `Bold = false` to disable bold), and a range style that covers the
+first written row of a headed sheet keeps that bold too. Pass `headerStyle:
+null` when only range styles are needed. Range keys use absolute worksheet
+coordinates, including when `startingRow` or `startingColumn` is set; `$A$1`
+references are also accepted.
+
+The same `headerStyle` and `styles` arguments are available on `WriteSheet`
+overloads for `DataTable`, `IDataReader`, typed lists, `object[][]` and
+`FormattedCell?[][]`.
 
 ### Multi-sheet write
 

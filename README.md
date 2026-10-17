@@ -18,6 +18,7 @@ without requiring Microsoft Excel.
   and `GetDateTime`.
 - Write from `DataTable`, `IDataReader`, object arrays or typed row lists.
 - Support multiple sheets, autofilters, hidden sheets and cell formatting.
+- Apply reusable cell styles (fills, font properties, number formats and XLSX alignment) by header or A1 range.
 - Update existing `.xlsx` and `.xlsb` sheets while preserving the rest of the workbook.
 - Update worksheet-backed pivot-cache ranges and mark dependent pivot tables for refresh.
 - Targets `net8.0`, `net9.0` and `net10.0`.
@@ -26,13 +27,13 @@ without requiring Microsoft Excel.
 ## Installation
 
 ```bash
-dotnet add package SpreadSheetTasks --version 1.0.3
+dotnet add package SpreadSheetTasks --version 1.1.0
 ```
 
 Or add the package reference manually:
 
 ```xml
-<PackageReference Include="SpreadSheetTasks" Version="1.0.3" />
+<PackageReference Include="SpreadSheetTasks" Version="1.1.0" />
 ```
 
 ## Quick start
@@ -88,6 +89,44 @@ using var writer = ExcelWriter.CreateWriter("products.xlsx");
 writer.AddSheet("Products");
 writer.WriteSheet(headers, types, rows, doAutofilter: true);
 ```
+
+### Apply cell styles
+
+`CellStyle` can style the first written row and arbitrary absolute A1 cells or
+ranges. Styles are deduplicated in the workbook, and later overlapping ranges
+override only the properties they specify.
+
+```csharp
+using SpreadSheetTasks;
+using System.Data;
+
+var table = new DataTable();
+table.Columns.Add("Product", typeof(string));
+table.Columns.Add("Quantity", typeof(int));
+table.Columns.Add("Comment", typeof(string));
+table.Rows.Add("Apples", 1200, "Restock soon");
+
+using var writer = new XlsxWriter("report.xlsx"); // same styling API on XlsbWriter
+writer.AddSheet("Data");
+writer.WriteSheet(table.CreateDataReader(),
+    headerStyle: new CellStyle { Fill = "008000", FontColor = "FFFFFF" },
+    styles: new Dictionary<string, CellStyle>
+    {
+        ["B2"] = new CellStyle { Fill = "FFF2CC", NumberFormat = F.THOUSANDS_SEP },
+        ["C2"] = new CellStyle { Fill = "FF0000", FontColor = "FFFFFF", Horizontal = "center", Wrap = true },
+    });
+```
+
+Supported properties are `Fill`, `FontColor`, `Bold`, `Italic`, `Underline`,
+`NumberFormat`, `Horizontal`, `Vertical` and `Wrap`. Colors are six-digit RGB
+hex, with or without `#`. `null` properties leave existing values unchanged;
+`FormattedCell.Format` takes precedence over a style number format. Alignment
+and wrapping are available for XLSX; XLSB throws `NotSupportedException` for
+those properties. A header style is merged with the default bold style (`Bold =
+false` disables bold), and a range style that covers the first written row of a
+headed sheet keeps that bold too. Pass `headerStyle: null` to apply only range
+styles. Range coordinates refer to the worksheet, even when `startingRow` or
+`startingColumn` is set.
 
 ### Update an existing XLSX or XLSB workbook
 

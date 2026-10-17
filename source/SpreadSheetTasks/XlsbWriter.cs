@@ -2,6 +2,7 @@ using System;
 using System.Buffers;
 using System.Collections.Generic;
 using System.Data;
+using System.Globalization;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
@@ -193,6 +194,7 @@ namespace SpreadSheetTasks
         private uint _endCol;
         private byte[] _colA;
         private byte[] _colZ;
+        private int _currentStartingColumn;
 
         private const int _rRkIntegerLowerLimit = -1 << 29;
         private const int _rRkIntegerUpperLimit = (1 << 29) - 1;
@@ -207,6 +209,18 @@ namespace SpreadSheetTasks
         internal const int XfStyleDate = 2;
         /// <summary>cellXfs index for bold header (font 1).</summary>
         internal const int XfStyleBoldHeader = 3;
+
+        /// <summary>ifmt id of the built-in datetime format "yyyy\-mm\-dd\ hh:mm" (BrtFmt 164).</summary>
+        private const int NumFmtIdDateTime = 164;
+        /// <summary>ifmt id of the built-in date format "yyyy\-mm\-dd" (BrtFmt 166).</summary>
+        private const int NumFmtIdDate = 166;
+
+        private static readonly byte[] _beginFontsMarker = [0xE3, 0x04, 0x04];       // BrtBeginFonts (0x0263)
+        private static readonly byte[] _endFontsMarker = [0xE4, 0x04, 0x00];         // BrtEndFonts (0x0264)
+        private static readonly byte[] _beginFillsMarker = [0xDB, 0x04, 0x04];       // BrtBeginFills (0x025B)
+        private static readonly byte[] _endFillsMarker = [0xDC, 0x04, 0x00];         // BrtEndFills (0x025C)
+        private static readonly byte[] _endCellStyleXfsMarker = [0xF3, 0x04, 0x00];  // BrtEndCellStyleXFs (0x0273)
+        private static readonly byte[] _endCellXfsMarker = [0xEA, 0x04, 0x00];       // BrtEndCellXFs (0x026A)
 
         /// <summary>
         /// Creates a new XLSB writer that will write to a file at <paramref name="path"/>.
@@ -271,6 +285,8 @@ namespace SpreadSheetTasks
 
         public override void WriteSheet(IDataReader dataReader, Boolean headers = true, int maxRows = -1, int startingRow = 0, int startingColumn = 0, bool doAutofilter = false)
         {
+            _currentStartingColumn = startingColumn;
+            EnsureNoAlignment();
             if (doAutofilter)
             {
                 _autofilterIsOn = true;
@@ -365,8 +381,9 @@ namespace SpreadSheetTasks
                         }
                     }
 
-                    InitRow(writtenRowNum);
-                    WriteRow(writtenRowNum == 0);
+                    InitRow(writtenRowNum + startingRow);
+                    Dictionary<int, CellStyle>? rowStyles = GetRowStyles(rowNum, startingRow, startingColumn, _columnCount);
+                    WriteRow(writtenRowNum == 0, rowStyles);
                     writtenRowNum++;
 
                     if (rowNum % 10000 == 0)
@@ -424,87 +441,101 @@ namespace SpreadSheetTasks
             //throw new NotImplementedException();
         }
 
-        private void WriteRow(bool boldedStyle)
+        private void WriteRow(bool boldedStyle, Dictionary<int, CellStyle>? rowStyles)
         {
             bool wroteAnyCell = false;
             for (int column = 0; column < _columnCount; column++)
             {
+                CellStyle? cellStyle = null;
+                rowStyles?.TryGetValue(column, out cellStyle);
+
                 if (_dataColReader.IsDBNull(column))
+                {
+                    if (cellStyle is not null)
+                    {
+                        WriteBlank(column, RegisterStyle(cellStyle));
+                        wroteAnyCell = true;
+                    }
                     continue;
+                }
 
                 wroteAnyCell = true;
 
                 object rawVal = _dataColReader.GetValue(column);
                 if (rawVal is FormattedCell fc)
                 {
-                    int fmtXfIndex = RegisterFormat(fc.Format);
+                    int fmtXfIndex = cellStyle is not null
+                        ? RegisterStyle(CellStyle.Merge(cellStyle, new CellStyle { NumberFormat = fc.Format }))
+                        : RegisterFormat(fc.Format);
                     WriteFormattedCellXlsb(fc.Value, fmtXfIndex, column);
                     continue;
                 }
 
+                int styleXf = cellStyle is not null ? RegisterStyle(cellStyle) : -1;
+
                 if (_newTypes[column] == TypeCode.String) // string
                 {
                     string stringValue = _dataColReader.GetString(column);
-                    WriteString(stringValue, column, boldedStyle);
+                    WriteString(stringValue, column, boldedStyle, styleXf);
                 }
                 else if (typesArray[column] == 5) // Memory<byte>
                 {
                     var stringValue = Encoding.UTF8.GetString(((Memory<byte>)(_dataColReader.GetValue(column))).Span);
-                    WriteString(stringValue, column, boldedStyle);
+                    WriteString(stringValue, column, boldedStyle, styleXf);
                 }
                 else if(_newTypes[column] == TypeCode.Object)
                 {
                     string stringValue = _dataColReader.GetValue(column).ToString();
-                    WriteString(stringValue, column);
+                    WriteString(stringValue, column, bolded: false, styleOverride: styleXf);
                 }
                 else if (_newTypes[column] == TypeCode.Boolean) // bool
                 {
-                    WriteBool(_dataColReader.GetBoolean(column), column);
+                    WriteBool(_dataColReader.GetBoolean(column), column, styleXf >= 0 ? styleXf : 0);
                 }
                 else if (typesArray[column] == 1)//number
                 {
-
+                    int styleNum = styleXf >= 0 ? styleXf : 0;
                     switch (_newTypes[column])
                     {
                         case TypeCode.Byte:
                             byte byteValue = _dataColReader.GetByte(column);
-                            WriteRkNumberInteger(byteValue, column);
+                            WriteRkNumberInteger(byteValue, column, styleNum);
                             break;
                         case TypeCode.SByte:
                             sbyte sbyteValue = _dataColReader.GetSByte(column);
-                            WriteRkNumberInteger(sbyteValue, column);
+                            WriteRkNumberInteger(sbyteValue, column, styleNum);
                             break;
                         case TypeCode.Int16:
                             Int16 int16Value = _dataColReader.GetInt16(column);
-                            WriteRkNumberInteger(Convert.ToInt32(int16Value), column);
+                            WriteRkNumberInteger(Convert.ToInt32(int16Value), column, styleNum);
                             break;
                         case TypeCode.Int32:
 
                             Int32 int32Value = _dataColReader.GetInt32(column);
                             if (int32Value >= _rRkIntegerLowerLimit && int32Value <= _rRkIntegerUpperLimit)
                             {
-                                WriteRkNumberInteger(int32Value, column);
+                                WriteRkNumberInteger(int32Value, column, styleNum);
                             }
                             else
                             {
-                                WriteDouble((double)int32Value, column);
+                                WriteDouble((double)int32Value, column, styleNum);
                             }
                             break;
                         case TypeCode.Int64:
                             Int64 int64Value = _dataColReader.GetInt64(column);
-                            WriteDouble(Convert.ToDouble(int64Value), column);
+                            WriteDouble(Convert.ToDouble(int64Value), column, styleNum);
                             break;
                         case TypeCode.Single:
                             float floatVal = _dataColReader.GetFloat(column);
-                            WriteDouble(Convert.ToDouble(floatVal), column);
+                            WriteDouble(Convert.ToDouble(floatVal), column, styleNum);
                             break;
                         case TypeCode.Double:
                             double doubleVal = _dataColReader.GetDouble(column);
-                            WriteDouble(doubleVal, column);
+                            WriteDouble(doubleVal, column, styleNum);
                             break;
                         case TypeCode.Decimal:
                             decimal decimalVal = _dataColReader.GetDecimal(column);
-                            WriteDouble(decimal.ToDouble(decimalVal), column);
+                            WriteDouble(decimal.ToDouble(decimalVal), column, styleNum);
                             break;
                         default:
                             throw new Exception("number format Excel error");
@@ -513,7 +544,8 @@ namespace SpreadSheetTasks
                 else if (typesArray[column] == 2) //date
                 {
                     DateTime dtVal = _dataColReader.GetDateTime(column);
-                    WriteDate(dtVal, column);
+                    int dateStyleXf = cellStyle is not null ? RegisterStyle(cellStyle, NumFmtIdDate) : XfStyleDate;
+                    WriteDate(dtVal, column, dateStyleXf);
                 }
                 else if (typesArray[column] == 3) //dateTime
                 {
@@ -522,14 +554,15 @@ namespace SpreadSheetTasks
                     {
                         continue;
                     }
-                    WriteDateTime(dtVal, column);
+                    int dateTimeStyleXf = cellStyle is not null ? RegisterStyle(cellStyle, NumFmtIdDateTime) : XfStyleDateTime;
+                    WriteDateTime(dtVal, column, dateTimeStyleXf);
                  }
                 
             }
 
             if (!wroteAnyCell)
             {
-                WriteBlank(0, boldedStyle ? 3 : 0);
+                WriteBlank(0, boldedStyle ? XfStyleBoldHeader : 0);
             }
         }
 
@@ -572,6 +605,8 @@ namespace SpreadSheetTasks
 
         public override void WriteSheet(string[] oneColumn)
         {
+            _currentStartingColumn = 0;
+            SetStyles(headerStyle: null, styles: null);
             if (sheetCnt != 1)
             {
                 _sheet1Bytes[54] = 156; // only first is selected
@@ -681,7 +716,7 @@ namespace SpreadSheetTasks
             Span<byte> buff = stackalloc byte[18];
             buff[0] = 5;
             buff[1] = 16;
-            BitConverter.TryWriteBytes(buff[2..], (int)colNum);
+            BitConverter.TryWriteBytes(buff[2..], colNum + _currentStartingColumn);
             BitConverter.TryWriteBytes(buff[6..], styleNum);
             BitConverter.TryWriteBytes(buff[10..], val);
             _stream.Write(buff);
@@ -692,7 +727,7 @@ namespace SpreadSheetTasks
             Span<byte> buff = stackalloc byte[11];
             buff[0] = 0x04;
             buff[1] = 8 + 1;
-            BitConverter.TryWriteBytes(buff[2..], (int)colNum);
+            BitConverter.TryWriteBytes(buff[2..], colNum + _currentStartingColumn);
             BitConverter.TryWriteBytes(buff[6..], styleNum);
             buff[10] = (byte)(val ? 1 : 0);
             _stream.Write(buff);
@@ -703,7 +738,7 @@ namespace SpreadSheetTasks
             Span<byte> buff = stackalloc byte[10];
             buff[0] = 0x01;
             buff[1] = 8;
-            BitConverter.TryWriteBytes(buff[2..], (int)colNum);
+            BitConverter.TryWriteBytes(buff[2..], colNum + _currentStartingColumn);
             BitConverter.TryWriteBytes(buff[6..], styleNum);
             _stream.Write(buff);
         }
@@ -713,7 +748,7 @@ namespace SpreadSheetTasks
             Span<byte> buff = stackalloc byte[14];
             buff[0] = 2;
             buff[1] = 12;
-            BitConverter.TryWriteBytes(buff[2..], (int)colNum);
+            BitConverter.TryWriteBytes(buff[2..], colNum + _currentStartingColumn);
             BitConverter.TryWriteBytes(buff[6..], styleNum);
 
             val <<= 2;
@@ -757,25 +792,25 @@ namespace SpreadSheetTasks
             _sstCntAll++;
         }
 
-        private void WriteDateTime(DateTime dateTime, int colNum)
+        private void WriteDateTime(DateTime dateTime, int colNum, int styleNum = XfStyleDateTime)
         {
             double d1 = dateTime.ToOADate();
-            WriteDouble(d1, colNum, 1); // 1 = datetime
+            WriteDouble(d1, colNum, styleNum);
         }
-        private void WriteDate(DateTime dateTime, int colNum)
+        private void WriteDate(DateTime dateTime, int colNum, int styleNum = XfStyleDate)
         {
             double d1 = dateTime.ToOADate();
             if (d1 > 1 << 20 - 50_000 || d1 < -(1 << 20 - 50_000))
             {
-                WriteDouble(d1, colNum, 2); // 2 = date
+                WriteDouble(d1, colNum, styleNum);
             }
             else
             {
                 Span<byte> buff = stackalloc byte[14];
                 buff[0] = 2;
                 buff[1] = 12;
-                BitConverter.TryWriteBytes(buff[2..], (int)colNum);
-                BitConverter.TryWriteBytes(buff[6..], 2);
+                BitConverter.TryWriteBytes(buff[2..], colNum + _currentStartingColumn);
+                BitConverter.TryWriteBytes(buff[6..], styleNum);
                 RkNumberGeneralWrite(buff[10..],d1);
                 _stream.Write(buff);
             }
@@ -786,7 +821,7 @@ namespace SpreadSheetTasks
             Span<byte> buff = stackalloc byte[14];
             buff[0] = 7;
             buff[1] = 12;
-            BitConverter.TryWriteBytes(buff[2..], (int)colNum);
+            BitConverter.TryWriteBytes(buff[2..], colNum + _currentStartingColumn);
 
             int styleNum = styleOverride >= 0 ? styleOverride : (bolded ? 3 : 0);
             BitConverter.TryWriteBytes(buff[6..], styleNum);
@@ -825,18 +860,95 @@ namespace SpreadSheetTasks
             return data;
         }
 
-        private static byte[] BuildXfRecord(int fontId, int ifmt, int flags, int byte6Extra = 0)
+        private static byte[] BuildXfRecord(int ifmt, int fontId, int fillId, ushort flags)
         {
             var data = new byte[18];
             data[0] = 0x2F;
             data[1] = 16;
-            BitConverter.TryWriteBytes(data.AsSpan(2, 2), (ushort)fontId);
+            // payload: ixfeParent(0), ifmt, iFont, iFill, ... flags
             BitConverter.TryWriteBytes(data.AsSpan(4, 2), (ushort)ifmt);
-            data[6] = (byte)byte6Extra;
+            BitConverter.TryWriteBytes(data.AsSpan(6, 2), (ushort)fontId);
+            BitConverter.TryWriteBytes(data.AsSpan(8, 2), (ushort)fillId);
             data[14] = 0x10;
             data[15] = 0x10;
-            BitConverter.TryWriteBytes(data.AsSpan(16, 2), (ushort)flags);
+            BitConverter.TryWriteBytes(data.AsSpan(16, 2), flags);
             return data;
+        }
+
+        private static int IndexOfBytes(byte[] source, byte[] pattern, int start)
+        {
+            int last = source.Length - pattern.Length;
+            for (int i = Math.Max(start, 0); i <= last; i++)
+            {
+                bool match = true;
+                for (int j = 0; j < pattern.Length; j++)
+                {
+                    if (source[i + j] != pattern[j])
+                    {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match)
+                {
+                    return i;
+                }
+            }
+            return -1;
+        }
+
+        /// <summary>
+        /// Writes an explicit RGB BrtColor ([MS-XLSB] 2.4.337): byte 0 packs fValidRGB
+        /// with xColorType 2 (standard ARGB, so the index byte is undefined and ignored),
+        /// then tint, then RGBA.
+        /// </summary>
+        private static void WriteXlsbColor(Span<byte> destination, string rgb)
+        {
+            destination[0] = 0x05;
+            destination[1] = 0xFF;
+            destination[2] = 0x00;
+            destination[3] = 0x00;
+            destination[4] = byte.Parse(rgb.AsSpan(0, 2), NumberStyles.HexNumber);
+            destination[5] = byte.Parse(rgb.AsSpan(2, 2), NumberStyles.HexNumber);
+            destination[6] = byte.Parse(rgb.AsSpan(4, 2), NumberStyles.HexNumber);
+            destination[7] = 0xFF;
+        }
+
+        /// <summary>
+        /// Builds a BrtFont record from the one in the template font section, patching
+        /// bold/italic/underline and the font color.
+        /// </summary>
+        private byte[] BuildFontRecord(FontKey key, int templateOffset, int templateRecordLength)
+        {
+            var record = new byte[2 + templateRecordLength];
+            Array.Copy(_stylesBin, templateOffset, record, 0, record.Length);
+
+            ushort fontFlags = (ushort)((key.Bold == true ? 1 : 0) | (key.Italic == true ? 2 : 0));
+            BitConverter.TryWriteBytes(record.AsSpan(4, 2), fontFlags);
+            BitConverter.TryWriteBytes(record.AsSpan(6, 2), (ushort)(key.Bold == true ? 700 : 400));
+            record[10] = (byte)(key.Underline == true ? 1 : 0);
+            if (key.Color is not null)
+            {
+                WriteXlsbColor(record.AsSpan(14, 8), key.Color);
+            }
+            return record;
+        }
+
+        /// <summary>
+        /// Builds a solid BrtFill record from the "none" fill in the template fill section,
+        /// patching the pattern and the foreground color.
+        /// </summary>
+        private byte[] BuildFillRecord(string rgb, int templateOffset, int templateRecordLength)
+        {
+            var record = new byte[2 + templateRecordLength];
+            Array.Copy(_stylesBin, templateOffset, record, 0, record.Length);
+
+            record[2] = 0x01; // solid
+            record[3] = 0x00;
+            record[4] = 0x00;
+            record[5] = 0x00;
+            WriteXlsbColor(record.AsSpan(6, 8), rgb);
+            return record;
         }
 
         private byte[] BuildStylesBytes()
@@ -865,65 +977,93 @@ namespace SpreadSheetTasks
             foreach (var rec in stFmtList)
                 ms.Write(rec);
 
-            // BrtEndFonts (type 0x0268)
+            // BrtEndFmts (type 0x0268)
             WriteBrtRecord(ms, 0x0268, Array.Empty<byte>());
 
-            // ── Copy Fills, Borders, CellStyleXFs from template ──
-            int fillStart = Array.IndexOf(_stylesBin, (byte)0xE3);
-            if (fillStart < 0) return _stylesBin;
+            // ── Fonts: same two fonts as the template plus deduplicated custom fonts ──
+            int fontsStart = IndexOfBytes(_stylesBin, _beginFontsMarker, 0);
+            if (fontsStart < 0) return _stylesBin;
+            int firstFont = fontsStart + 7;
+            int fontRecordLength = _stylesBin[firstFont + 1];
+            int fontsEnd = IndexOfBytes(_stylesBin, _endFontsMarker, firstFont);
+            int fillsStart = fontsEnd < 0 ? -1 : IndexOfBytes(_stylesBin, _beginFillsMarker, fontsEnd);
+            if (fontsEnd < 0 || fillsStart < 0) return _stylesBin;
 
-            int cellXfRecStart = -1;
-            for (int i = fillStart; i < _stylesBin.Length - 1; i++)
+            ms.Write(_stylesBin, fontsStart, 3);
+            var fontsCount = new byte[4];
+            BitConverter.TryWriteBytes(fontsCount, _fontRegistry.Count + 1); // two built-in fonts, seed covers the bold one
+            ms.Write(fontsCount);
+            ms.Write(_stylesBin, firstFont, fontsEnd - firstFont);
+            foreach (var kvp in _fontRegistry.OrderBy(kvp => kvp.Value))
             {
-                if (_stylesBin[i] == 0xE9 && _stylesBin[i + 1] == 0x04)
-                { cellXfRecStart = i; break; }
+                if (kvp.Value < 2)
+                {
+                    continue;
+                }
+                ms.Write(BuildFontRecord(kvp.Key, firstFont, fontRecordLength));
             }
-            if (cellXfRecStart < fillStart) return _stylesBin;
+            ms.Write(_stylesBin, fontsEnd, 3);
 
-            int cellXfRecEnd = -1;
-            for (int i = cellXfRecStart + 1; i < _stylesBin.Length - 2; i++)
+            // ── Fills: none + gray125 plus deduplicated solid fills ──
+            int firstFill = fillsStart + 7;
+            int fillRecordLength = _stylesBin[firstFill + 1];
+            int fillsEnd = IndexOfBytes(_stylesBin, _endFillsMarker, firstFill);
+            int cellXfRecStart = fillsEnd < 0 ? -1 : IndexOfBytes(_stylesBin, _endCellStyleXfsMarker, fillsEnd);
+            if (fillsEnd < 0 || cellXfRecStart < 0) return _stylesBin;
+
+            ms.Write(_stylesBin, fillsStart, 3);
+            var fillsCount = new byte[4];
+            BitConverter.TryWriteBytes(fillsCount, 2 + _fillRegistry.Count);
+            ms.Write(fillsCount);
+            ms.Write(_stylesBin, firstFill, fillsEnd - firstFill);
+            foreach (var kvp in _fillRegistry.OrderBy(kvp => kvp.Value))
             {
-                if (_stylesBin[i] == 0xEA && _stylesBin[i + 1] == 0x04 && _stylesBin[i + 2] == 0x00)
-                { cellXfRecEnd = i; break; }
+                ms.Write(BuildFillRecord(kvp.Key, firstFill, fillRecordLength));
             }
-            if (cellXfRecEnd < cellXfRecStart) return _stylesBin;
+            ms.Write(_stylesBin, fillsEnd, 3);
 
-            // Find and copy through BrtEndCellStyleXFs (before cellXFs section)
-            // BrtBeginCellStyleXFs (0x0272) → [0xF2,0x04]
-            int cellStyleXfEnd = -1;
-            for (int i = fillStart; i < cellXfRecStart - 2; i++)
-            {
-                if (_stylesBin[i] == 0xF3 && _stylesBin[i + 1] == 0x04 && _stylesBin[i + 2] == 0x00)
-                { cellStyleXfEnd = i; break; }
-            }
+            // ── Borders, cellStyleXFs from template ──
+            ms.Write(_stylesBin, fillsEnd + 3, cellXfRecStart + 3 - (fillsEnd + 3));
 
-            if (cellStyleXfEnd > fillStart)
-                ms.Write(_stylesBin, fillStart, cellStyleXfEnd + 3 - fillStart);
-            else
-                ms.Write(_stylesBin, fillStart, cellXfRecStart - fillStart);
+            // Find the end of the cellXFs section to copy the rest of the template after it.
+            int cellXfSectionEnd = IndexOfBytes(_stylesBin, _endCellXfsMarker, cellXfRecStart);
+            if (cellXfSectionEnd < 0) return _stylesBin;
 
             // ── Build custom cellXFs section ──
-            int totalXf = 4 + _formatXfMap.Count;
+            int totalXf = 4 + _formatXfMap.Count + _styleComponents.Count;
 
             var xfHeader = new byte[4];
             BitConverter.TryWriteBytes(xfHeader, (ushort)totalXf);
             WriteBrtRecord(ms, 0x0269, xfHeader);
 
-            ms.Write(BuildXfRecord(0, 0, 0x0000));
-            ms.Write(BuildXfRecord(0, 164, 0x0001));
-            ms.Write(BuildXfRecord(0, 166, 0x0001));
-            ms.Write(BuildXfRecord(1, 0, 0x0000, 1));
+            ms.Write(BuildXfRecord(0, 0, 0, 0x0000));
+            ms.Write(BuildXfRecord(164, 0, 0, 0x0001));
+            ms.Write(BuildXfRecord(166, 0, 0, 0x0001));
+            ms.Write(BuildXfRecord(0, 1, 0, 0x0000));
 
-            foreach (var kvp in _formatXfMap.OrderBy(k => k.Value))
+            // Format XFs and style XFs share one index space, so they must be emitted
+            // in index order: the position in cellXfs is the value a cell references.
+            var customXfs = new SortedDictionary<int, byte[]>();
+            foreach (var kvp in _formatXfMap)
             {
-                int numFmtId = _formatRegistry[kvp.Key];
-                ms.Write(BuildXfRecord(0, numFmtId, 0x0001));
+                customXfs[kvp.Value] = BuildXfRecord(_formatRegistry[kvp.Key], 0, 0, 0x0001);
+            }
+            foreach (var kvp in _styleComponents)
+            {
+                StyleComponent component = kvp.Value;
+                customXfs[kvp.Key] = BuildXfRecord(
+                    component.NumFmtId, component.FontId, component.FillId,
+                    component.NumFmtId != 0 ? (ushort)0x0001 : (ushort)0x0000);
+            }
+            foreach (var xf in customXfs.Values)
+            {
+                ms.Write(xf);
             }
 
             WriteBrtRecord(ms, 0x026A, Array.Empty<byte>());
 
             // ── Copy remaining template ──
-            int afterCellXf = cellXfRecEnd + 3;
+            int afterCellXf = cellXfSectionEnd + 3;
             ms.Write(_stylesBin, afterCellXf, _stylesBin.Length - afterCellXf);
 
             return ms.ToArray();

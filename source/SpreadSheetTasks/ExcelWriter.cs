@@ -18,17 +18,189 @@ namespace SpreadSheetTasks
         internal Dictionary<string, int> _formatXfMap = new();
         internal int _nextNumFmtId = 165;
         internal int _nextXfIndex = 4;
-        internal bool _hasCustomFormats => _formatRegistry.Count > 0;
+
+        /// <summary>Custom font definitions, keyed by the properties that change the font. Id 1 is the built-in bold font.</summary>
+        internal Dictionary<FontKey, int> _fontRegistry = new() { [new FontKey(null, true, null, null)] = 1 };
+        /// <summary>Custom solid fill colors; ids start at 2 because 0 (none) and 1 (gray125) are built in.</summary>
+        internal Dictionary<string, int> _fillRegistry = new() { };
+        private int _nextFontId = 2;
+        private int _nextFillId = 2;
+
+        /// <summary>Cell style definitions, keyed by style and an optional built-in number-format id.</summary>
+        internal Dictionary<(CellStyle Style, int NumFmtIdOverride), int> _styleXfMap = new();
+        /// <summary>Components of every style XF, keyed by the XF index.</summary>
+        internal Dictionary<int, StyleComponent> _styleComponents = new();
+
+        internal List<StyleRange>? _styleRanges;
+        internal CellStyle? _headerStyle;
+        /// <summary>Reused by <see cref="GetRowStyles"/>; only valid until the next call.</summary>
+        private readonly Dictionary<int, CellStyle> _rowStylesScratch = new();
+
+        internal bool _hasCustomFormats => _formatRegistry.Count > 0 || _styleComponents.Count > 0;
 
         internal int RegisterFormat(string formatString)
         {
             if (_formatXfMap.TryGetValue(formatString, out int xfIndex))
                 return xfIndex;
-            int numFmtId = _nextNumFmtId++;
-            _formatRegistry[formatString] = numFmtId;
+            // A style may already have registered this format; reuse its id so both
+            // XFs keep referencing a number format that is actually emitted.
+            if (!_formatRegistry.TryGetValue(formatString, out int numFmtId))
+            {
+                numFmtId = _nextNumFmtId++;
+                _formatRegistry[formatString] = numFmtId;
+            }
             xfIndex = _nextXfIndex++;
             _formatXfMap[formatString] = xfIndex;
             return xfIndex;
+        }
+
+        /// <summary>
+        /// Registers a cell style and returns its cellXfs index. Fonts, fills and number
+        /// formats are deduplicated, so cells sharing a style share one Excel style record.
+        /// </summary>
+        /// <param name="style">The style to register.</param>
+        /// <param name="numFmtIdOverride">
+        /// Built-in number-format id (for example 14 for a date) used when the style does not
+        /// set <see cref="CellStyle.NumberFormat"/> itself, so a styled date keeps looking like a date.
+        /// </param>
+        internal int RegisterStyle(CellStyle style, int numFmtIdOverride = 0)
+        {
+            ArgumentNullException.ThrowIfNull(style);
+            int effectiveOverride = style.NumberFormat is null ? numFmtIdOverride : 0;
+            var key = (style, effectiveOverride);
+            if (_styleXfMap.TryGetValue(key, out int xfIndex))
+                return xfIndex;
+
+            int fontId = 0;
+            FontKey fontKey = style.ToFontKey();
+            if (fontKey != new FontKey(null, null, null, null))
+            {
+                if (!_fontRegistry.TryGetValue(fontKey, out fontId))
+                {
+                    fontId = _nextFontId++;
+                    _fontRegistry[fontKey] = fontId;
+                }
+            }
+
+            int fillId = 0;
+            if (style.Fill is not null && !_fillRegistry.TryGetValue(style.Fill, out fillId))
+            {
+                fillId = _nextFillId++;
+                _fillRegistry[style.Fill] = fillId;
+            }
+
+            int numFmtId = 0;
+            if (style.NumberFormat is not null)
+            {
+                if (!_formatRegistry.TryGetValue(style.NumberFormat, out numFmtId))
+                {
+                    numFmtId = _nextNumFmtId++;
+                    _formatRegistry[style.NumberFormat] = numFmtId;
+                }
+            }
+            else if (numFmtIdOverride != 0)
+            {
+                numFmtId = numFmtIdOverride;
+            }
+
+            xfIndex = _nextXfIndex++;
+            _styleXfMap[key] = xfIndex;
+            _styleComponents[xfIndex] = new StyleComponent(fontId, fillId, numFmtId, style);
+            return xfIndex;
+        }
+
+        /// <summary>Stores the per-sheet header style and range styles selected by the caller.</summary>
+        internal void SetStyles(CellStyle? headerStyle, IReadOnlyDictionary<string, CellStyle>? styles)
+        {
+            List<StyleRange>? parsedRanges = A1Reference.ParseStyleRanges(styles);
+            _headerStyle = headerStyle;
+            _styleRanges = parsedRanges;
+        }
+
+        /// <summary>
+        /// Throws when any configured style needs alignment/wrapping, which is not yet
+        /// supported by the XLSB writer.
+        /// </summary>
+        internal void EnsureNoAlignment()
+        {
+            if (_headerStyle is not null && _headerStyle.HasAlignment)
+            {
+                ThrowAlignmentNotSupported();
+            }
+            if (_styleRanges is not null)
+            {
+                foreach (StyleRange range in _styleRanges)
+                {
+                    if (range.Style.HasAlignment)
+                    {
+                        ThrowAlignmentNotSupported();
+                    }
+                }
+            }
+
+            static void ThrowAlignmentNotSupported() => throw new NotSupportedException(
+                "horizontal/vertical alignment and wrapping are not yet supported for XLSB output.");
+        }
+
+        /// <summary>
+        /// Returns the sparse column-to-style map for one written row, or null when the row
+        /// has no styles. Range keys are absolute worksheet coordinates; the returned map is
+        /// keyed by column index relative to <paramref name="startingColumn"/>. The returned
+        /// dictionary is only valid until the next call.
+        /// </summary>
+        internal Dictionary<int, CellStyle>? GetRowStyles(int rowNum, int startingRow, int startingColumn, int columnCount)
+        {
+            if (_headerStyle is null && _styleRanges is null)
+            {
+                return null;
+            }
+
+            _rowStylesScratch.Clear();
+            bool anyStyle = false;
+            if (rowNum == 0 && _headerStyle is not null)
+            {
+                CellStyle effectiveHeader = CellStyle.Merge(new CellStyle { Bold = true }, _headerStyle);
+                for (int column = 0; column < columnCount; column++)
+                {
+                    _rowStylesScratch[column] = effectiveHeader;
+                }
+                anyStyle = true;
+            }
+
+            if (_styleRanges is not null)
+            {
+                // In a headed write a range style on the first row is merged on top of the
+                // same bold default that header strings receive, so styling a header cell
+                // does not silently drop the bold.
+                bool defaultBoldHeaderRow = rowNum == 0 && _areHeaders && _headerStyle is null;
+                int absoluteRow = rowNum + startingRow;
+                foreach (StyleRange range in _styleRanges)
+                {
+                    if (range.FirstRow > absoluteRow || absoluteRow > range.LastRow)
+                    {
+                        continue;
+                    }
+                    int firstAbsoluteColumn = Math.Max(range.FirstColumn, startingColumn);
+                    int lastAbsoluteColumn = Math.Min(range.LastColumn, startingColumn + columnCount - 1);
+                    if (firstAbsoluteColumn > lastAbsoluteColumn)
+                    {
+                        continue;
+                    }
+                    for (int absoluteColumn = firstAbsoluteColumn; absoluteColumn <= lastAbsoluteColumn; absoluteColumn++)
+                    {
+                        int column = absoluteColumn - startingColumn;
+                        _rowStylesScratch.TryGetValue(column, out CellStyle? existing);
+                        if (existing is null && defaultBoldHeaderRow)
+                        {
+                            existing = new CellStyle { Bold = true };
+                        }
+                        _rowStylesScratch[column] = CellStyle.Merge(existing, range.Style);
+                        anyStyle = true;
+                    }
+                }
+            }
+
+            return anyStyle ? _rowStylesScratch : null;
         }
 
         internal static readonly HashSet<Type> _numberTypes =
@@ -222,7 +394,44 @@ namespace SpreadSheetTasks
 
         internal abstract void FinalizeFile();
         public abstract void AddSheet(string sheetName, bool hidden = false);
+
+        /// <summary>
+        /// Writes the rows of an <see cref="IDataReader"/> to the current sheet.
+        /// </summary>
+        /// <param name="dataReader">Source rows.</param>
+        /// <param name="headers">If true, the first row is treated as a header row (bold).</param>
+        /// <param name="maxRows">Maximum number of columns to write; -1 writes all.</param>
+        /// <param name="startingRow">Zero-based row index where writing begins.</param>
+        /// <param name="startingColumn">Zero-based column index where writing begins.</param>
+        /// <param name="doAutofilter">If true, add an autofilter on the written range.</param>
         public abstract void WriteSheet(IDataReader dataReader, Boolean headers = true, int maxRows = -1, int startingRow = 0, int startingColumn = 0, bool doAutofilter = false);
+
+        /// <summary>
+        /// Writes rows with a style for the first written row and/or A1 cell ranges.
+        /// The header style is merged with the default bold header style; set
+        /// <see cref="CellStyle.Bold"/> to false to disable bold.
+        /// </summary>
+        /// <param name="dataReader">Source rows.</param>
+        /// <param name="headerStyle">Optional style applied to the first written row.</param>
+        /// <param name="styles">Optional mapping of absolute worksheet A1 cell/range references to styles.</param>
+        /// <param name="headers">If true, the first row is treated as a header row.</param>
+        /// <param name="maxRows">Maximum number of columns to write; -1 writes all.</param>
+        /// <param name="startingRow">Zero-based row index where writing begins.</param>
+        /// <param name="startingColumn">Zero-based column index where writing begins.</param>
+        /// <param name="doAutofilter">If true, add an autofilter on the written range.</param>
+        public void WriteSheet(IDataReader dataReader, CellStyle? headerStyle, IReadOnlyDictionary<string, CellStyle>? styles = null,
+            Boolean headers = true, int maxRows = -1, int startingRow = 0, int startingColumn = 0, bool doAutofilter = false)
+        {
+            SetStyles(headerStyle, styles);
+            try
+            {
+                WriteSheet(dataReader, headers, maxRows, startingRow, startingColumn, doAutofilter);
+            }
+            finally
+            {
+                SetStyles(null, null);
+            }
+        }
 
         /// <summary>
         /// Obsolete. Use <see cref="WriteSheet(IDataReader, bool, int, int, int, bool)"/> with the
@@ -232,9 +441,27 @@ namespace SpreadSheetTasks
         public void WriteSheet(IDataReader dataReader, bool headers, int overLimit, int startingRow, int startingColumn, bool doAutofilter, bool _overLimitRenameMarker)
             => WriteSheet(dataReader, headers, overLimit, startingRow, startingColumn, doAutofilter);
 
+        /// <summary>
+        /// Writes the rows of a <see cref="DataTable"/> to the current sheet.
+        /// </summary>
         public virtual void WriteSheet(DataTable dataTable, Boolean headers = true, int maxRows = -1, int startingRow = 0, int startingColumn = 0, bool doAutofilter = false)
         {
             WriteSheet(dataTable.CreateDataReader(), headers, maxRows, startingRow, startingColumn, doAutofilter);
+        }
+
+        /// <summary>Writes a table with a style for the first written row and/or A1 cell ranges.</summary>
+        public void WriteSheet(DataTable dataTable, CellStyle? headerStyle, IReadOnlyDictionary<string, CellStyle>? styles = null,
+            Boolean headers = true, int maxRows = -1, int startingRow = 0, int startingColumn = 0, bool doAutofilter = false)
+        {
+            SetStyles(headerStyle, styles);
+            try
+            {
+                WriteSheet(dataTable, headers, maxRows, startingRow, startingColumn, doAutofilter);
+            }
+            finally
+            {
+                SetStyles(null, null);
+            }
         }
 
         /// <summary>
@@ -245,6 +472,9 @@ namespace SpreadSheetTasks
         public void WriteSheet(DataTable dataTable, bool headers, int overLimit, int startingRow, int startingColumn, bool doAutofilter, bool _overLimitRenameMarker)
             => WriteSheet(dataTable, headers, overLimit, startingRow, startingColumn, doAutofilter);
 
+        /// <summary>
+        /// Writes typed rows to the current sheet.
+        /// </summary>
         public void WriteSheet(List<string> headersList, List<TypeCode> typeCodes, List<object?[]> rows, Boolean headers = true, int maxRows = -1, int startingRow = 0, int startingColumn = 0, bool doAutofilter = false)
         {
             ArgumentNullException.ThrowIfNull(headersList);
@@ -253,6 +483,18 @@ namespace SpreadSheetTasks
 
             using var reader = new ReaderFromList(rows, headersList, typeCodes);
             WriteSheet(reader, headers, maxRows, startingRow, startingColumn, doAutofilter);
+        }
+
+        /// <summary>Writes typed rows with a style for the first written row and/or A1 cell ranges.</summary>
+        public void WriteSheet(List<string> headersList, List<TypeCode> typeCodes, List<object?[]> rows, CellStyle? headerStyle,
+            IReadOnlyDictionary<string, CellStyle>? styles = null, Boolean headers = true, int maxRows = -1,
+            int startingRow = 0, int startingColumn = 0, bool doAutofilter = false)
+        {
+            ArgumentNullException.ThrowIfNull(headersList);
+            ArgumentNullException.ThrowIfNull(typeCodes);
+            ArgumentNullException.ThrowIfNull(rows);
+            using var reader = new ReaderFromList(rows, headersList, typeCodes);
+            WriteSheet(reader, headerStyle, styles, headers, maxRows, startingRow, startingColumn, doAutofilter);
         }
 
         /// <summary>
@@ -297,6 +539,21 @@ namespace SpreadSheetTasks
             WriteSheet(dt, headers: headers, startingRow: startingRow, startingColumn: startingColumn, doAutofilter: doAutofilter);
         }
 
+        /// <summary>Writes raw rows with a style for the first written row and/or A1 cell ranges.</summary>
+        public void WriteSheet(object?[][] rows, CellStyle? headerStyle, IReadOnlyDictionary<string, CellStyle>? styles = null,
+            int startingRow = 0, int startingColumn = 0, bool doAutofilter = false, bool headers = true)
+        {
+            SetStyles(headerStyle, styles);
+            try
+            {
+                WriteSheet(rows, startingRow, startingColumn, doAutofilter, headers);
+            }
+            finally
+            {
+                SetStyles(null, null);
+            }
+        }
+
         /// <summary>
         /// Writes a 2D jagged array of raw values with custom column header names.
         /// The first row of <paramref name="rows"/> is data (not headers); column names are
@@ -328,6 +585,21 @@ namespace SpreadSheetTasks
                 dt.Rows.Add(dataRow);
             }
             WriteSheet(dt, headers: true, startingRow: startingRow, startingColumn: startingColumn, doAutofilter: doAutofilter);
+        }
+
+        /// <summary>Writes raw rows with named columns and a style for the first written row and/or A1 ranges.</summary>
+        public void WriteSheet(object?[][] rows, string[] headers, CellStyle? headerStyle,
+            IReadOnlyDictionary<string, CellStyle>? styles = null, int startingRow = 0, int startingColumn = 0, bool doAutofilter = false)
+        {
+            SetStyles(headerStyle, styles);
+            try
+            {
+                WriteSheet(rows, headers, startingRow, startingColumn, doAutofilter);
+            }
+            finally
+            {
+                SetStyles(null, null);
+            }
         }
 
         /// <summary>
@@ -364,6 +636,21 @@ namespace SpreadSheetTasks
             WriteSheet(dt, headers: headers, startingRow: startingRow, startingColumn: startingColumn, doAutofilter: doAutofilter);
         }
 
+        /// <summary>Writes formatted rows with a style for the first written row and/or A1 cell ranges.</summary>
+        public void WriteSheet(FormattedCell?[][] rows, CellStyle? headerStyle, IReadOnlyDictionary<string, CellStyle>? styles = null,
+            int startingRow = 0, int startingColumn = 0, bool doAutofilter = false, bool headers = true)
+        {
+            SetStyles(headerStyle, styles);
+            try
+            {
+                WriteSheet(rows, startingRow, startingColumn, doAutofilter, headers);
+            }
+            finally
+            {
+                SetStyles(null, null);
+            }
+        }
+
         /// <summary>
         /// Writes a 2D jagged array of <see cref="FormattedCell"/> values with custom column header names.
         /// The first row of <paramref name="rows"/> is data (not headers); column names are taken from
@@ -396,6 +683,21 @@ namespace SpreadSheetTasks
                 dt.Rows.Add(dataRow);
             }
             WriteSheet(dt, headers: true, startingRow: startingRow, startingColumn: startingColumn, doAutofilter: doAutofilter);
+        }
+
+        /// <summary>Writes formatted rows with named columns and a style for the first row and/or A1 ranges.</summary>
+        public void WriteSheet(FormattedCell?[][] rows, string[] headers, CellStyle? headerStyle,
+            IReadOnlyDictionary<string, CellStyle>? styles = null, int startingRow = 0, int startingColumn = 0, bool doAutofilter = false)
+        {
+            SetStyles(headerStyle, styles);
+            try
+            {
+                WriteSheet(rows, headers, startingRow, startingColumn, doAutofilter);
+            }
+            finally
+            {
+                SetStyles(null, null);
+            }
         }
 
         public abstract void WriteSheet(string[] oneColumn);
@@ -492,5 +794,7 @@ namespace SpreadSheetTasks
         }
     }
 
-}
+    /// <summary>Font, fill and number-format ids of one cellXfs entry together with its style.</summary>
+    internal readonly record struct StyleComponent(int FontId, int FillId, int NumFmtId, CellStyle Style);
 
+}
