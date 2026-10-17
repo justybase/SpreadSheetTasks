@@ -346,11 +346,13 @@ public class StyleTests
                     });
             }
 
-            using var reader = new XlsxOrXlsbReadOrEdit();
-            reader.Open(path);
-            var rows = ReadRows(reader, "Data");
-            Assert.Single(rows);
-            Assert.Equal(1234.5, Convert.ToDouble(rows[0][0]));
+            using (var reader = new XlsxOrXlsbReadOrEdit())
+            {
+                reader.Open(path);
+                var rows = ReadRows(reader, "Data");
+                Assert.Single(rows);
+                Assert.Equal(1234.5, Convert.ToDouble(rows[0][0]));
+            }
 
             if (extension == ".xlsx")
             {
@@ -393,10 +395,12 @@ public class StyleTests
 
             if (extension == ".xlsx")
             {
-                using var archive = ZipFile.OpenRead(path);
-                var sheetXml = System.Text.Encoding.UTF8.GetString(ReadEntry(archive, "xl/worksheets/sheet1.xml"));
-                // B2 is the only written cell and must carry the style.
-                Assert.Contains("<row r=\"2\"><c r=\"B2\" s=\"4\" t=\"s\">", sheetXml);
+                using (var archive = ZipFile.OpenRead(path))
+                {
+                    var sheetXml = System.Text.Encoding.UTF8.GetString(ReadEntry(archive, "xl/worksheets/sheet1.xml"));
+                    // B2 is the only written cell and must carry the style.
+                    Assert.Contains("<row r=\"2\"><c r=\"B2\" s=\"4\" t=\"s\">", sheetXml);
+                }
 
                 // A range keyed relative to the write start must not style B2.
                 using (var writer = new XlsxWriter(path))
@@ -406,6 +410,7 @@ public class StyleTests
                         headerStyle: null,
                         styles: new Dictionary<string, CellStyle> { ["A1"] = new CellStyle { Fill = "FFF2CC" } });
                 }
+
                 using var archive2 = ZipFile.OpenRead(path);
                 var sheetXml2 = System.Text.Encoding.UTF8.GetString(ReadEntry(archive2, "xl/worksheets/sheet1.xml"));
                 Assert.Contains("<row r=\"2\"><c r=\"B2\" t=\"s\">", sheetXml2);
@@ -531,12 +536,14 @@ public class StyleTests
                     headerStyle: new CellStyle { Fill = "008000", FontColor = "FFFFFF" });
             }
 
-            using var reader = new XlsxOrXlsbReadOrEdit();
-            reader.Open(path);
-            var readRows = ReadRows(reader, "Data");
-            Assert.Single(readRows);
-            Assert.Equal(10, Convert.ToInt32(readRows[0][0]));
-            Assert.Equal(1.5, Convert.ToDouble(readRows[0][1]));
+            using (var reader = new XlsxOrXlsbReadOrEdit())
+            {
+                reader.Open(path);
+                var readRows = ReadRows(reader, "Data");
+                Assert.Single(readRows);
+                Assert.Equal(10, Convert.ToInt32(readRows[0][0]));
+                Assert.Equal(1.5, Convert.ToDouble(readRows[0][1]));
+            }
 
             if (extension == ".xlsx")
             {
