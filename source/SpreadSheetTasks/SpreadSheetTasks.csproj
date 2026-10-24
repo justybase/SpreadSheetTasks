@@ -13,11 +13,11 @@
     <Description>High-performance .NET library for reading and writing Excel files (.xlsx, .xlsb), with streaming APIs and NativeAOT validation.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
 	<PackageReadmeFile>README.md</PackageReadmeFile>
-    <AssemblyVersion>2.0.0.0</AssemblyVersion>
-    <FileVersion>2.0.0.0</FileVersion>
-	 <Version>2.0.0</Version>
+    <AssemblyVersion>2.0.1.0</AssemblyVersion>
+    <FileVersion>2.0.1.0</FileVersion>
+	 <Version>2.0.1</Version>
 	<LangVersion>latest</LangVersion>
-    <PackageReleaseNotes>Breaking: GetRowsOfSheet now returns a new array per row; use GetRowsOfSheetReadOnly for the reused-buffer scan. Adds reusable cell styles for header rows and A1 ranges (XLSX alignment and wrapping included), preserves number, date and boolean types in untyped columns, escapes ST_Xstring and CR in shared and inline strings, recognises date formats by token, and keeps the full width of sparse rows.</PackageReleaseNotes>
+    <PackageReleaseNotes>XLSB now defaults to CompressionLevel.Optimal (zlib level 6) instead of Fastest, and small Int64 values are written as 4-byte RK numbers, reducing XLSB file size and write time. XLSX remains on Optimal. Pass a different CompressionLevel to the writer constructor to override the default.</PackageReleaseNotes>
     <PackageTags>xlsx;xlsb;excel;spreadsheets;nativeaot;aot;trimming</PackageTags>
     <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
     <RepositoryUrl>https://github.com/KrzysztofDusko/SpreadSheetTasks</RepositoryUrl>

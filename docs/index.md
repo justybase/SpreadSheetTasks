@@ -47,7 +47,7 @@ dotnet add package SpreadSheetTasks
 ```
 
 ```xml
-<PackageReference Include="SpreadSheetTasks" Version="2.0.0" />
+<PackageReference Include="SpreadSheetTasks" Version="2.0.1" />
 ```
 
 ## Performance and NativeAOT

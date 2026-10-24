@@ -27,13 +27,13 @@ without requiring Microsoft Excel.
 ## Installation
 
 ```bash
-dotnet add package SpreadSheetTasks --version 2.0.0
+dotnet add package SpreadSheetTasks --version 2.0.1
 ```
 
 Or add the package reference manually:
 
 ```xml
-<PackageReference Include="SpreadSheetTasks" Version="2.0.0" />
+<PackageReference Include="SpreadSheetTasks" Version="2.0.1" />
 ```
 
 ## Quick start
