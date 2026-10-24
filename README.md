@@ -27,13 +27,13 @@ without requiring Microsoft Excel.
 ## Installation
 
 ```bash
-dotnet add package SpreadSheetTasks --version 2.0.1
+dotnet add package SpreadSheetTasks --version 2.1.0
 ```
 
 Or add the package reference manually:
 
 ```xml
-<PackageReference Include="SpreadSheetTasks" Version="2.0.1" />
+<PackageReference Include="SpreadSheetTasks" Version="2.1.0" />
 ```
 
 ## Quick start
@@ -55,6 +55,35 @@ writer.AddSheet("People");
 writer.WriteSheet(table.CreateDataReader());
 ```
 
+### Compression and large writes
+
+Both writers default to **zlib level 3**: the same balanced level used by the
+JavaScript and Python implementations compared in `comparison/`. SST uses a
+small built-in ZIP writer for that default, so writes are 13–21% faster than
+the previous `CompressionLevel.Optimal` (zlib 6) path, at a modestly larger
+file size. Explicit `CompressionLevel` values keep the standard .NET
+`ZipArchive` path, and non-seekable streams fall back to it automatically
+(where level 3 maps to `Optimal` on .NET 8, which has no numeric levels).
+
+```csharp
+using System.IO.Compression;
+using SpreadSheetTasks;
+
+// Default: zlib level 3 (seekable output)
+using var balanced = new XlsxWriter("balanced.xlsx");
+
+// Explicit levels keep the previous enum behaviour
+using var fastest = new XlsxWriter("fastest.xlsx", _clvl: CompressionLevel.Fastest);
+using var smallest = new XlsbWriter("smallest.xlsb", compressionLevel: CompressionLevel.SmallestSize);
+```
+
+XLSB can inline strings instead of maintaining a shared-string table. This is
+useful when most text is unique or when the final shared-string pass matters:
+
+```csharp
+using var inline = new XlsbWriter("inline.xlsb", useSharedStrings: false);
+```
+
 ### Read rows without loading the whole workbook
 
 ```csharp
@@ -71,6 +100,11 @@ while (reader.Read())
     Console.WriteLine($"{name}: {age}");
 }
 ```
+
+On hot paths, `reader.CurrentRow` exposes the current row as a
+`ReadOnlySpan<FieldInfo>` without boxing numbers, dates or booleans. The span
+is valid until the next `Read()` call; see
+[GetExcelDataType / GetNativeValue](docs/index.md#getexceldatatype--getnativevalue).
 
 ### Write typed rows
 
@@ -200,6 +234,13 @@ Version 1.0.0 introduced the following corrected names:
 | `UseMemoryStreamInXlsb` field | `UseMemoryStreamInXlsb` property |
 
 The old members remain available with `[Obsolete]` warnings where applicable.
+
+Version 2.1.0 changes the default ZIP compression to zlib level 3 and makes the
+compression-level constructor parameters nullable (`null` = level 3). Pass
+`CompressionLevel.Optimal` explicitly to keep the previous level-6 file sizes.
+`XlsbWriter` also gained an optional `useSharedStrings` parameter, and
+`ExcelReaderAbstract.CurrentRow` was added. Because the constructor signatures
+changed, recompile against 2.1.0 rather than mixing binaries from 2.0.x.
 
 ## License
 

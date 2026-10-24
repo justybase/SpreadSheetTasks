@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
 	<TargetFrameworks>net10.0;net9.0;net8.0</TargetFrameworks>
 	<Nullable>enable</Nullable>
@@ -13,11 +13,11 @@
     <Description>High-performance .NET library for reading and writing Excel files (.xlsx, .xlsb), with streaming APIs and NativeAOT validation.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
 	<PackageReadmeFile>README.md</PackageReadmeFile>
-    <AssemblyVersion>2.0.1.0</AssemblyVersion>
-    <FileVersion>2.0.1.0</FileVersion>
-	 <Version>2.0.1</Version>
+    <AssemblyVersion>2.1.0.0</AssemblyVersion>
+    <FileVersion>2.1.0.0</FileVersion>
+	 <Version>2.1.0</Version>
 	<LangVersion>latest</LangVersion>
-    <PackageReleaseNotes>XLSB now defaults to CompressionLevel.Optimal (zlib level 6) instead of Fastest, and small Int64 values are written as 4-byte RK numbers, reducing XLSB file size and write time. XLSX remains on Optimal. Pass a different CompressionLevel to the writer constructor to override the default.</PackageReleaseNotes>
+    <PackageReleaseNotes>Default ZIP compression is now zlib level 3 for both XLSX and XLSB through a built-in ZIP writer, making writes 13-21% faster at a slightly larger file size; pass an explicit CompressionLevel to keep the previous enum-based behaviour. XLSB adds useSharedStrings: false for inline strings, row writes are buffered, shared strings are encoded in bulk, and ExcelReaderAbstract.CurrentRow exposes the current row as ReadOnlySpan&lt;FieldInfo&gt; without boxing. Readers now open files read-only with FileShare.Read, so read-only files and concurrent readers work.</PackageReleaseNotes>
     <PackageTags>xlsx;xlsb;excel;spreadsheets;nativeaot;aot;trimming</PackageTags>
     <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
     <RepositoryUrl>https://github.com/KrzysztofDusko/SpreadSheetTasks</RepositoryUrl>

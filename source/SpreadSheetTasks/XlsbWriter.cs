@@ -189,6 +189,12 @@ namespace SpreadSheetTasks
 
         private BufferedStream _stream;
 
+        // Cell records are assembled here and written to the ZIP stream once per row (or when the
+        // buffer fills), matching the row-buffer design used by xlspy and the TypeScript port.
+        private const int RowBufferSize = 1 << 17; // 128 KiB, enough for a 32 767-character inline string
+        private readonly byte[] _rowBuffer = new byte[RowBufferSize];
+        private int _rowBufferPosition;
+
         private int _columnCount;
         private uint _startCol;
         private uint _endCol;
@@ -199,7 +205,7 @@ namespace SpreadSheetTasks
         private const int _rRkIntegerLowerLimit = -1 << 29;
         private const int _rRkIntegerUpperLimit = (1 << 29) - 1;
 
-        private readonly CompressionLevel _compressionLevel = CompressionLevel.Optimal;
+        private readonly bool _useSharedStrings;
 
         /// <summary>cellXfs index for general/numeric style.</summary>
         internal const int XfStyleGeneral = 0;
@@ -227,8 +233,17 @@ namespace SpreadSheetTasks
         /// The file is overwritten if it already exists.
         /// </summary>
         /// <param name="path">Path of the .xlsb file to create.</param>
-        /// <param name="compressionLevel">Compression level for the zip archive. The enum has no numeric levels; Optimal is the closest in output size to zlib level 3.</param>
-        public XlsbWriter(string path, CompressionLevel compressionLevel = CompressionLevel.Optimal)
+        /// <param name="compressionLevel">
+        /// Optional ZIP compression level. When omitted, a balanced zlib level 3 is used
+        /// (the same default as xlspy and justybase_spreadsheet_tasks). Pass
+        /// <see cref="CompressionLevel.Optimal"/> for the previous level-6 behaviour.
+        /// </param>
+        /// <param name="useSharedStrings">
+        /// When false, strings are written inline in each cell instead of the shared-string table.
+        /// This avoids the per-workbook string dictionary and the final sharedStrings pass, at the
+        /// cost of a slightly larger file when text repeats. Defaults to true.
+        /// </param>
+        public XlsbWriter(string path, CompressionLevel? compressionLevel = null, bool useSharedStrings = true)
         {
             ArgumentNullException.ThrowIfNull(path);
             ArgumentException.ThrowIfNullOrWhiteSpace(path);
@@ -238,9 +253,9 @@ namespace SpreadSheetTasks
             {
                 fs = new FileStream(path, FileMode.Create);
                 sheetCnt = 0;
-                _compressionLevel = compressionLevel;
+                _useSharedStrings = useSharedStrings;
                 _newExcelFileStream = fs;
-                _excelArchiveFile = new ZipArchive(_newExcelFileStream, ZipArchiveMode.Create, false);
+                _excelArchiveFile = new ExcelZipWriter(_newExcelFileStream, compressionLevel, leaveOpen: false);
                 _excelStreamWasProvided = false;
             }
             catch
@@ -254,16 +269,24 @@ namespace SpreadSheetTasks
         /// Creates a new XLSB writer that writes to the supplied <see cref="Stream"/>.
         /// </summary>
         /// <param name="stream">Destination stream. The writer takes ownership of the stream position but does not close it unless <paramref name="leaveExcelArchiveOpen"/> is false.</param>
-        /// <param name="compressionLevel">Compression level for the zip archive. The enum has no numeric levels; Optimal is the closest in output size to zlib level 3.</param>
-        /// <param name="leaveExcelArchiveOpen">If true, the underlying <see cref="ZipArchive"/> is left open when <see cref="Save"/> runs. Defaults to true for the stream ctor; the file-path ctor always sets it to false.</param>
-        public XlsbWriter(Stream stream, CompressionLevel compressionLevel = CompressionLevel.Optimal, bool leaveExcelArchiveOpen = true)
+        /// <param name="compressionLevel">
+        /// Optional ZIP compression level. When omitted, a balanced zlib level 3 is used for
+        /// seekable streams. Non-seekable streams fall back to <see cref="CompressionLevel.Optimal"/>,
+        /// because <see cref="ZipArchive"/> is required there.
+        /// </param>
+        /// <param name="leaveExcelArchiveOpen">If true, the underlying archive is left open when <see cref="Save"/> runs. Defaults to true for the stream ctor; the file-path ctor always sets it to false.</param>
+        /// <param name="useSharedStrings">
+        /// When false, strings are written inline in each cell instead of the shared-string table.
+        /// Defaults to true.
+        /// </param>
+        public XlsbWriter(Stream stream, CompressionLevel? compressionLevel = null, bool leaveExcelArchiveOpen = true, bool useSharedStrings = true)
         {
             ArgumentNullException.ThrowIfNull(stream);
             _excelStreamWasProvided = true;
             sheetCnt = 0;
-            _compressionLevel = compressionLevel;
+            _useSharedStrings = useSharedStrings;
             _newExcelFileStream = stream;
-            _excelArchiveFile = new ZipArchive(_newExcelFileStream, ZipArchiveMode.Create, leaveExcelArchiveOpen);
+            _excelArchiveFile = new ExcelZipWriter(_newExcelFileStream, compressionLevel, leaveExcelArchiveOpen);
         }
 
         public override void AddSheet(string sheetName, bool hidden = false)
@@ -357,8 +380,8 @@ namespace SpreadSheetTasks
             {
                 _sheet1Bytes[54] = 0x9C; // only first is selected
             }
-            var newEntry = _excelArchiveFile.CreateEntry(_sheetList[sheetCnt - 1].pathInArchive, _compressionLevel);
-            _stream = new BufferedStream(newEntry.Open());
+            var newEntry = _excelArchiveFile.CreateEntry(_sheetList[sheetCnt - 1].pathInArchive);
+            _stream = new BufferedStream(newEntry.Open(), 65_536);
             try
             {
                 InitSheet(doAutofilter);
@@ -393,7 +416,8 @@ namespace SpreadSheetTasks
                     rowNum++;
                 }
                 _rowsCount = writtenRowNum - 1;
-                
+
+                FlushRowBuffer();
                 _stream.Write(_sheet1Bytes[218..290].AsSpan());
 
                 if (doAutofilter)
@@ -449,7 +473,8 @@ namespace SpreadSheetTasks
                 CellStyle? cellStyle = null;
                 rowStyles?.TryGetValue(column, out cellStyle);
 
-                if (_dataColReader.IsDBNull(column))
+                object rawVal = _dataColReader.GetValue(column);
+                if (rawVal is null or DBNull)
                 {
                     if (cellStyle is not null)
                     {
@@ -460,8 +485,6 @@ namespace SpreadSheetTasks
                 }
 
                 wroteAnyCell = true;
-
-                object rawVal = _dataColReader.GetValue(column);
                 if (rawVal is FormattedCell fc)
                 {
                     int fmtXfIndex = cellStyle is not null
@@ -554,7 +577,7 @@ namespace SpreadSheetTasks
                 else if (typesArray[column] == 3) //dateTime
                 {
                     DateTime dtVal = _dataColReader.GetDateTime(column);
-                    if (SuppressYear1000Dates && (dtVal as DateTime?).Value.Year == 1000)//1000-xx-xx
+                    if (SuppressYear1000Dates && dtVal.Year == 1000)//1000-xx-xx
                     {
                         continue;
                     }
@@ -568,6 +591,8 @@ namespace SpreadSheetTasks
             {
                 WriteBlank(0, boldedStyle ? XfStyleBoldHeader : 0);
             }
+
+            FlushRowBuffer();
         }
 
         /// <summary>Writes a value of an untyped column with its own type. Returns false for text values.</summary>
@@ -668,8 +693,8 @@ namespace SpreadSheetTasks
             {
                 _sheet1Bytes[54] = 156; // only first is selected
             }
-            var newEntry = _excelArchiveFile.CreateEntry(_sheetList[sheetCnt - 1].pathInArchive, _compressionLevel);
-            _stream = new BufferedStream(newEntry.Open());
+            var newEntry = _excelArchiveFile.CreateEntry(_sheetList[sheetCnt - 1].pathInArchive);
+            _stream = new BufferedStream(newEntry.Open(), 65_536);
             try
             {
                 InitSheet(false);
@@ -678,6 +703,7 @@ namespace SpreadSheetTasks
                     string txt = oneColumn[rowNum];
                     InitRow((int)rowNum);
                     WriteString(txt, 0);
+                    FlushRowBuffer();
                 }
 
                 _stream.Write(_sheet1Bytes, 218, _sheet1Bytes.Length - 218); // całkowity koniec
@@ -752,6 +778,59 @@ namespace SpreadSheetTasks
             _stream.WriteByte(0); // pos. 176 // BrtACEnd
         }
 
+        /// <summary>Flushes the current row buffer to the ZIP entry stream.</summary>
+        private void FlushRowBuffer()
+        {
+            if (_rowBufferPosition > 0)
+            {
+                _stream.Write(_rowBuffer, 0, _rowBufferPosition);
+                _rowBufferPosition = 0;
+            }
+        }
+
+        private void EnsureRowBuffer(int size)
+        {
+            if (size > _rowBuffer.Length)
+            {
+                // A single record larger than the buffer: flush the pending bytes and let the
+                // caller write the oversized record directly.
+                FlushRowBuffer();
+                return;
+            }
+
+            if (_rowBufferPosition + size > _rowBuffer.Length)
+            {
+                FlushRowBuffer();
+            }
+        }
+
+        private void WriteToRowBuffer(ReadOnlySpan<byte> data)
+        {
+            if (data.Length > _rowBuffer.Length)
+            {
+                FlushRowBuffer();
+                _stream.Write(data);
+                return;
+            }
+
+            EnsureRowBuffer(data.Length);
+            data.CopyTo(_rowBuffer.AsSpan(_rowBufferPosition));
+            _rowBufferPosition += data.Length;
+        }
+
+        private void WriteVarintToRowBuffer(uint value)
+        {
+            Span<byte> buffer = stackalloc byte[5];
+            int position = 0;
+            while (value >= 0x80)
+            {
+                buffer[position++] = (byte)((value & 0x7F) | 0x80);
+                value >>= 7;
+            }
+            buffer[position++] = (byte)value;
+            WriteToRowBuffer(buffer[..position]);
+        }
+
         //private readonly static byte[] rowNeededBytes = { 0, 0, 0, 0, 44, 1, 0, 0, 0, 1, 0, 0, 0 };
         private void InitRow(int rowNumber)
         {
@@ -765,7 +844,7 @@ namespace SpreadSheetTasks
             BitConverter.TryWriteBytes(buff[(6 + 13)..], (int)_startCol);
             BitConverter.TryWriteBytes(buff[(6 + 13 + 4)..], (int)_endCol);
             
-            _stream.Write(buff);// 6 + 13 + 4 + 4 = 27
+            WriteToRowBuffer(buff);// 6 + 13 + 4 + 4 = 27
         }
 
         private void WriteDouble(double val, int colNum, int styleNum = 0)
@@ -776,7 +855,7 @@ namespace SpreadSheetTasks
             BitConverter.TryWriteBytes(buff[2..], colNum + _currentStartingColumn);
             BitConverter.TryWriteBytes(buff[6..], styleNum);
             BitConverter.TryWriteBytes(buff[10..], val);
-            _stream.Write(buff);
+            WriteToRowBuffer(buff);
         }
 
         private void WriteBool(bool val, int colNum, int styleNum = 0)
@@ -787,7 +866,7 @@ namespace SpreadSheetTasks
             BitConverter.TryWriteBytes(buff[2..], colNum + _currentStartingColumn);
             BitConverter.TryWriteBytes(buff[6..], styleNum);
             buff[10] = (byte)(val ? 1 : 0);
-            _stream.Write(buff);
+            WriteToRowBuffer(buff);
         }
 
         private void WriteBlank(int colNum, int styleNum = 0)
@@ -797,7 +876,7 @@ namespace SpreadSheetTasks
             buff[1] = 8;
             BitConverter.TryWriteBytes(buff[2..], colNum + _currentStartingColumn);
             BitConverter.TryWriteBytes(buff[6..], styleNum);
-            _stream.Write(buff);
+            WriteToRowBuffer(buff);
         }
 
         private void WriteRkNumberInteger(int val, int colNum, int styleNum = 0)
@@ -812,7 +891,7 @@ namespace SpreadSheetTasks
             val |= 0b00000010;
 
             BitConverter.TryWriteBytes(buff[10..], val);
-            _stream.Write(buff);
+            WriteToRowBuffer(buff);
         }
 
         /// <summary>Writes an integer as a 4-byte RK value when it fits, otherwise as an 8-byte double.</summary>
@@ -854,6 +933,12 @@ namespace SpreadSheetTasks
 
         private void WriteString(string stringValue, int colNum, bool bolded = false, int styleOverride = -1)
         {
+            if (!_useSharedStrings)
+            {
+                WriteInlineString(stringValue, colNum, bolded, styleOverride);
+                return;
+            }
+
             ref var index = ref CollectionsMarshal.GetValueRefOrAddDefault(_sstDic, stringValue, out bool exists);
             if (!exists)
             {
@@ -862,6 +947,34 @@ namespace SpreadSheetTasks
             }
             WriteStringFromShared(index, colNum, bolded, styleOverride);
             _sstCntAll++;
+        }
+
+        /// <summary>
+        /// Writes BrtCellSt (0x06): an inline UTF-16 string stored in the cell itself.
+        /// This is the <c>useSharedStrings: false</c> path and avoids the shared-string dictionary.
+        /// </summary>
+        private void WriteInlineString(string stringValue, int colNum, bool bolded, int styleOverride)
+        {
+            int textLength = Math.Min(stringValue.Length, 32_767);
+            int payloadLength = 12 + textLength * 2;
+            int styleNum = styleOverride >= 0 ? styleOverride : (bolded ? XfStyleBoldHeader : XfStyleGeneral);
+
+            WriteVarintToRowBuffer(0x06);
+            WriteVarintToRowBuffer((uint)payloadLength);
+            EnsureRowBuffer(payloadLength);
+
+            Span<byte> header = stackalloc byte[12];
+            BitConverter.TryWriteBytes(header, colNum + _currentStartingColumn);
+            BitConverter.TryWriteBytes(header[4..], styleNum);
+            BitConverter.TryWriteBytes(header[8..], textLength);
+            WriteToRowBuffer(header);
+
+            if (textLength > 0)
+            {
+                Span<byte> encoded = _rowBuffer.AsSpan(_rowBufferPosition, textLength * 2);
+                int written = Encoding.Unicode.GetBytes(stringValue.AsSpan(0, textLength), encoded);
+                _rowBufferPosition += written;
+            }
         }
 
         private void WriteDateTime(DateTime dateTime, int colNum, int styleNum = XfStyleDateTime)
@@ -884,7 +997,7 @@ namespace SpreadSheetTasks
                 BitConverter.TryWriteBytes(buff[2..], colNum + _currentStartingColumn);
                 BitConverter.TryWriteBytes(buff[6..], styleNum);
                 RkNumberGeneralWrite(buff[10..],d1);
-                _stream.Write(buff);
+                WriteToRowBuffer(buff);
             }
         }
 
@@ -899,7 +1012,7 @@ namespace SpreadSheetTasks
             BitConverter.TryWriteBytes(buff[6..], styleNum);
 
             BitConverter.TryWriteBytes(buff[10..], (int)val);
-            _stream.Write(buff);
+            WriteToRowBuffer(buff);
         }
 
         private static void WriteVarint(Stream s, uint value)
@@ -1144,14 +1257,14 @@ namespace SpreadSheetTasks
         internal override void FinalizeFile()
         {
             SaveSst();
-            var newEntry = _excelArchiveFile.CreateEntry(@"xl/styles.bin", _compressionLevel);
+            var newEntry = _excelArchiveFile.CreateEntry(@"xl/styles.bin");
             using (var str = newEntry.Open())
             {
                 using var sw = new BinaryWriter(str);
                 sw.Write(BuildStylesBytes());
             }
 
-            newEntry = _excelArchiveFile.CreateEntry(@"xl/workbook.bin", _compressionLevel);
+            newEntry = _excelArchiveFile.CreateEntry(@"xl/workbook.bin");
             using (var str = newEntry.Open())
             {
                 using var sw = new BinaryWriter(str);
@@ -1198,13 +1311,13 @@ namespace SpreadSheetTasks
             for (int i = 0; i < _sheetList.Count; i++)
             {
                 var (_, _, _, _, _, sheetId,_) = _sheetList[i];
-                newEntry = _excelArchiveFile.CreateEntry($@"xl/worksheets/binaryIndex{sheetId}.bin", _compressionLevel);
+                newEntry = _excelArchiveFile.CreateEntry($@"xl/worksheets/binaryIndex{sheetId}.bin");
                 using var str = newEntry.Open();
                 using var sw = new BinaryWriter(str);
                 sw.Write(_binaryIndexBin);
             }
 
-            newEntry = _excelArchiveFile.CreateEntry(@"[Content_Types].xml", _compressionLevel);
+            newEntry = _excelArchiveFile.CreateEntry(@"[Content_Types].xml");
             using (var str = newEntry.Open())
             {
                 using var sw = new StreamWriter(str, Encoding.UTF8);
@@ -1223,7 +1336,10 @@ namespace SpreadSheetTasks
                 }
 
                 sw.Write(@"<Override PartName=""/xl/styles.bin"" ContentType=""application/vnd.ms-excel.styles""/>");
-                sw.Write(@"<Override PartName=""/xl/sharedStrings.bin"" ContentType=""application/vnd.ms-excel.sharedStrings""/>");
+                if (_useSharedStrings)
+                {
+                    sw.Write(@"<Override PartName=""/xl/sharedStrings.bin"" ContentType=""application/vnd.ms-excel.sharedStrings""/>");
+                }
 
                 if (!String.IsNullOrWhiteSpace(DocPropertyProgramName))
                 {
@@ -1233,7 +1349,7 @@ namespace SpreadSheetTasks
                 sw.Write(@"</Types>");
             }
 
-            newEntry = _excelArchiveFile.CreateEntry($"xl/_rels/workbook.bin.rels", _compressionLevel);
+            newEntry = _excelArchiveFile.CreateEntry($"xl/_rels/workbook.bin.rels");
             using (var str = newEntry.Open())
             {
                 using var sw = new StreamWriter(str, Encoding.UTF8);
@@ -1248,11 +1364,14 @@ namespace SpreadSheetTasks
                 }
 
                 sw.Write($@"<Relationship Id=""rId{_sheetList.Count + 2}"" Type=""http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles"" Target=""styles.bin""/>");
-                sw.Write($@"<Relationship Id=""rId{_sheetList.Count + 3}"" Type=""http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings"" Target=""sharedStrings.bin""/>");
+                if (_useSharedStrings)
+                {
+                    sw.Write($@"<Relationship Id=""rId{_sheetList.Count + 3}"" Type=""http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings"" Target=""sharedStrings.bin""/>");
+                }
                 sw.Write(@"</Relationships>");
             }
 
-            newEntry = _excelArchiveFile.CreateEntry($"_rels/.rels", _compressionLevel);
+            newEntry = _excelArchiveFile.CreateEntry($"_rels/.rels");
             using (var str = newEntry.Open())
             {
                 using var sw = new StreamWriter(str, Encoding.UTF8);
@@ -1273,7 +1392,7 @@ namespace SpreadSheetTasks
 
             if (!String.IsNullOrWhiteSpace(DocPropertyProgramName))
             {
-                var e2 = _excelArchiveFile.CreateEntry("docProps/app.xml", _compressionLevel);
+                var e2 = _excelArchiveFile.CreateEntry("docProps/app.xml");
                 using (var str = e2.Open())
                 using (var sw = new StreamWriter(str, Encoding.UTF8))
                 {
@@ -1301,7 +1420,7 @@ namespace SpreadSheetTasks
                     sw.Write(@"</Properties>");
                 }
 
-                newEntry = _excelArchiveFile.CreateEntry($"docProps/core.xml", _compressionLevel);
+                newEntry = _excelArchiveFile.CreateEntry($"docProps/core.xml");
                 using (var str = newEntry.Open())
                 {
                     using var coreSw = new StreamWriter(str, Encoding.UTF8);
@@ -1317,7 +1436,7 @@ namespace SpreadSheetTasks
 
             foreach (var (_, _, _, _, nameInArchive, sheetId, _) in _sheetList)
             {
-                newEntry = _excelArchiveFile.CreateEntry($"xl/worksheets/_rels/{nameInArchive}.rels", _compressionLevel);
+                newEntry = _excelArchiveFile.CreateEntry($"xl/worksheets/_rels/{nameInArchive}.rels");
                 using var str = newEntry.Open();
                 using var sw = new StreamWriter(str, Encoding.UTF8);
                 sw.WriteLine(@"<?xml version=""1.0"" encoding=""UTF-8"" standalone=""yes""?>");
@@ -1443,7 +1562,12 @@ namespace SpreadSheetTasks
 
         private void SaveSst()
         {
-            var newSST = _excelArchiveFile.CreateEntry($"xl/sharedStrings.bin", _compressionLevel);
+            // Keep writing an empty SST when shared strings are enabled: workbook.bin and
+            // [Content_Types].xml still reference the part, and readers expect it to exist.
+            if (!_useSharedStrings)
+                return;
+
+            var newSST = _excelArchiveFile.CreateEntry($"xl/sharedStrings.bin");
             int bufferLen = 1 << 17;// 2*256 * 256;
             var _buffX = ArrayPool<byte>.Shared.Rent(bufferLen);
             try
@@ -1501,16 +1625,9 @@ namespace SpreadSheetTasks
 
                     Int32ToSpecificBuffer(_buffX, (int)txtLen, localPosition);
                     localPosition += 4;
-                    for (int i = 0; i < txtLen; i++)
-                    {
-                        _buffX[localPosition++] = (byte)(txt[i]); // = txt[i] % 256
-                        _buffX[localPosition++] = (byte)(txt[i] >> 8); // = (byte)(txt[i]/256)
-
-                        //_buff2[0] = (byte)(txt[i]); // = txt[i] % 256
-                        //_buff2[1] = (byte)(txt[i] >> 8); // = (byte)(txt[i]/256)
-                        //binaryWriter.Write(_buff2, 0, 2);
-                        //binaryWriter.Write(BitConverter.GetBytes(txt[i]));
-                    }
+                    // Bulk UTF-16 encoding instead of a per-char loop (the xlspy C path does the same).
+                    localPosition += Encoding.Unicode.GetBytes(
+                        txt.AsSpan(0, txtLen), _buffX.AsSpan(localPosition));
                     //binaryWriter.Write(_buffX, 0, localPosition);
                 }
                 binaryWriter.Write(_buffX, 0, localPosition);

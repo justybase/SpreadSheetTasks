@@ -133,6 +133,23 @@ namespace SpreadSheetTasks
         }
 
         /// <summary>
+        /// The current row as a span of <see cref="FieldInfo"/> values, without boxing numbers,
+        /// dates or booleans into an <c>object[]</c>. The span is only valid until the next
+        /// <see cref="Read"/> call.
+        /// </summary>
+        public ReadOnlySpan<FieldInfo> CurrentRow
+        {
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            get
+            {
+                if (innerRow is null)
+                    return default;
+                int count = Math.Min(FieldCount, innerRow.Length);
+                return innerRow.AsSpan(0, count);
+            }
+        }
+
+        /// <summary>
         /// Returns the Excel cell-type for the cell at <paramref name="i"/> in the current row.
         /// Use this when you want to know the underlying cell type (e.g. <see cref="ExcelDataType.Int64"/>,
         /// <see cref="ExcelDataType.Double"/>, <see cref="ExcelDataType.DateTime"/>,

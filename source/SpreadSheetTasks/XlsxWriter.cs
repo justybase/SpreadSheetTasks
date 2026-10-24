@@ -19,8 +19,6 @@ namespace SpreadSheetTasks
         internal static readonly string[] _letters;
         private readonly bool _useScharedStrings;
 
-        private readonly CompressionLevel _clvl;
-
         private const double _dateTimeWidth = 16.0;
         private const double _dateWidth = 10.140625;
 
@@ -44,8 +42,12 @@ namespace SpreadSheetTasks
         /// <param name="bufferSize">Size of the I/O write buffer.</param>
         /// <param name="InMemoryMode">If true, sheet content is written directly to the zip entry stream; if false, a temp file is used per sheet.</param>
         /// <param name="useScharedStrings">If true, string values are deduplicated via the sharedStrings part.</param>
-        /// <param name="_clvl">Compression level for the zip archive. The enum has no numeric levels; Optimal is the closest in output size to zlib level 3.</param>
-        public XlsxWriter(string filePath, int bufferSize = 4096, bool InMemoryMode = true, bool useScharedStrings = true, CompressionLevel _clvl = CompressionLevel.Optimal)
+        /// <param name="_clvl">
+        /// Optional ZIP compression level. When omitted, a balanced zlib level 3 is used
+        /// (matching xlspy and justybase_spreadsheet_tasks). Pass
+        /// <see cref="CompressionLevel.Optimal"/> for the previous level-6 behaviour.
+        /// </param>
+        public XlsxWriter(string filePath, int bufferSize = 4096, bool InMemoryMode = true, bool useScharedStrings = true, CompressionLevel? _clvl = null)
         {
             ArgumentNullException.ThrowIfNull(filePath);
             ArgumentException.ThrowIfNullOrWhiteSpace(filePath);
@@ -61,8 +63,7 @@ namespace SpreadSheetTasks
                 _useScharedStrings = useScharedStrings;
                 if (_useScharedStrings)
                     _sstDic = new Dictionary<string, int>();
-                this._clvl = _clvl;
-                _excelArchiveFile = new ZipArchive(_newExcelFileStream, ZipArchiveMode.Create, leaveOpen: false);
+                _excelArchiveFile = new ExcelZipWriter(_newExcelFileStream, _clvl, leaveOpen: false);
                 _excelStreamWasProvided = false;
             }
             catch
@@ -79,9 +80,12 @@ namespace SpreadSheetTasks
         /// <param name="bufferSize">Size of the I/O write buffer.</param>
         /// <param name="InMemoryMode">If true, sheet content is written directly to the zip entry stream.</param>
         /// <param name="useScharedStrings">If true, string values are deduplicated via the sharedStrings part.</param>
-        /// <param name="_clvl">Compression level for the zip archive. The enum has no numeric levels; Optimal is the closest in output size to zlib level 3.</param>
-        /// <param name="leaveExcelArchiveOpen">If true, the underlying <see cref="ZipArchive"/> is left open when <see cref="Save"/> runs. Defaults to true for the stream ctor; the file-path ctor always sets it to false.</param>
-        public XlsxWriter(Stream stream, int bufferSize = 4096, bool InMemoryMode = true, bool useScharedStrings = true, CompressionLevel _clvl = CompressionLevel.Optimal, bool leaveExcelArchiveOpen = true)
+        /// <param name="_clvl">
+        /// Optional ZIP compression level. When omitted, a balanced zlib level 3 is used for
+        /// seekable streams. Non-seekable streams fall back to <see cref="CompressionLevel.Optimal"/>.
+        /// </param>
+        /// <param name="leaveExcelArchiveOpen">If true, the underlying archive is left open when <see cref="Save"/> runs. Defaults to true for the stream ctor; the file-path ctor always sets it to false.</param>
+        public XlsxWriter(Stream stream, int bufferSize = 4096, bool InMemoryMode = true, bool useScharedStrings = true, CompressionLevel? _clvl = null, bool leaveExcelArchiveOpen = true)
         {
             ArgumentNullException.ThrowIfNull(stream);
             _excelStreamWasProvided = true;
@@ -92,8 +96,7 @@ namespace SpreadSheetTasks
             _useScharedStrings = useScharedStrings;
             if (_useScharedStrings)
                 _sstDic = new Dictionary<string, int>();
-            this._clvl = _clvl;
-            _excelArchiveFile = new ZipArchive(_newExcelFileStream, ZipArchiveMode.Create, leaveOpen: leaveExcelArchiveOpen);
+            _excelArchiveFile = new ExcelZipWriter(_newExcelFileStream, _clvl, leaveExcelArchiveOpen);
         }
 
 
@@ -145,7 +148,7 @@ namespace SpreadSheetTasks
             {
                 for (int i = 0; i < sheetCnt + 1; i++)
                 {
-                    _excelArchiveFile.CreateEntryFromFile(_sheetList[i].pathOnDisc, _sheetList[i].pathInArchive, _clvl);
+                    _excelArchiveFile.CreateEntryFromFile(_sheetList[i].pathOnDisc, _sheetList[i].pathInArchive);
                     File.Delete(_sheetList[i].pathOnDisc);
                 }
             }
@@ -164,7 +167,7 @@ namespace SpreadSheetTasks
             _dataColReader = new DataColReader(dataReader, headers, maxRows);
             if (_inMemoryMode)
             {
-                var e1 = _excelArchiveFile.CreateEntry(_sheetList[sheetCnt].pathInArchive, _clvl);
+                var e1 = _excelArchiveFile.CreateEntry(_sheetList[sheetCnt].pathInArchive);
                 using StreamWriter daneZakladkiX = new FormattingStreamWriter(e1.Open(), Encoding.UTF8, bufferSize: _bufferSize, CultureInfo.InvariantCulture.NumberFormat);
                 _rowsCount = WriteSheet(daneZakladkiX, startingRow, startingColumn, doAutofilter: doAutofilter) - 1;
             }
@@ -181,7 +184,7 @@ namespace SpreadSheetTasks
             _dataColReader = new DataColReader(dataTable, headers, maxRows);
             if (_inMemoryMode)
             {
-                var e1 = _excelArchiveFile.CreateEntry(_sheetList[sheetCnt].pathInArchive, _clvl);
+                var e1 = _excelArchiveFile.CreateEntry(_sheetList[sheetCnt].pathInArchive);
                 using StreamWriter daneZakladkiX = new FormattingStreamWriter(e1.Open(), Encoding.UTF8, bufferSize: _bufferSize, CultureInfo.InvariantCulture.NumberFormat);
                 _rowsCount = WriteSheet(daneZakladkiX, startingRow, startingColumn,doAutofilter: doAutofilter) - 1;
             }
@@ -573,7 +576,7 @@ namespace SpreadSheetTasks
             _dataColReader = new DataColReader(dane);
             if (_inMemoryMode)
             {
-                var e1 = _excelArchiveFile.CreateEntry(_sheetList[sheetCnt].pathInArchive, _clvl);
+                var e1 = _excelArchiveFile.CreateEntry(_sheetList[sheetCnt].pathInArchive);
                 using StreamWriter writter = new FormattingStreamWriter(e1.Open(), Encoding.UTF8, bufferSize: _bufferSize, CultureInfo.InvariantCulture.NumberFormat);
                 WriteSheet(writter, 0, 0);
             }
@@ -675,7 +678,8 @@ namespace SpreadSheetTasks
                 CellStyle? cellStyle = null;
                 rowStyles?.TryGetValue(column, out cellStyle);
 
-                if (_dataColReader.IsDBNull(column))
+                object rawVal = _dataColReader.GetValue(column);
+                if (rawVal is null or DBNull)
                 {
                     if (cellStyle is not null)
                     {
@@ -697,7 +701,6 @@ namespace SpreadSheetTasks
 
                 bool hasGap = column > lastWrittenColumn + 1;
 
-                object rawVal = _dataColReader.GetValue(column);
                 if (rawVal is FormattedCell fc)
                 {
                     object innerVal = fc.Value;
@@ -827,7 +830,7 @@ namespace SpreadSheetTasks
                     WriteCellStart(hasGap, column, rowNumber, styleXf);
                     WriteStringToBuffer("><v>");
 
-                    WriteDoubleToBuffer((double)(dtVal as DateTime?)?.ToOADate()!);
+                    WriteDoubleToBuffer(dtVal.ToOADate());
                     WriteStringToBuffer("</v></c>");
                     if (!_inMemoryMode)
                     {
@@ -838,14 +841,14 @@ namespace SpreadSheetTasks
                 else if (typesArray[column] == 3) //datetime
                 {
                     DateTime dtVal = _dataColReader.GetDateTime(column);
-                    if (SuppressYear1000Dates && (dtVal as DateTime?).Value.Year == 1000)//1000-xx-xx
+                    if (SuppressYear1000Dates && dtVal.Year == 1000)//1000-xx-xx
                     {
                         continue;
                     }
                     int styleXf = cellStyle is not null ? RegisterStyle(cellStyle, NumFmtIdDateTime) : XfStyleDateTime;
                     WriteCellStart(hasGap, column, rowNumber, styleXf);
                     WriteStringToBuffer("><v>");
-                    WriteDoubleToBuffer((double)((dtVal) as DateTime?)?.ToOADate()!);
+                    WriteDoubleToBuffer(dtVal.ToOADate());
                     WriteStringToBuffer("</v></c>");
                     if (!_inMemoryMode)
                     {
@@ -917,7 +920,7 @@ namespace SpreadSheetTasks
         private const string _filterDefinedName = "_xlnm._FilterDatabase";
         internal override void FinalizeFile()
         {
-            var e1 = _excelArchiveFile.CreateEntry("[Content_Types].xml", _clvl);
+            var e1 = _excelArchiveFile.CreateEntry("[Content_Types].xml");
 
             using (var writer = new FormattingStreamWriter(e1.Open(), CultureInfo.InvariantCulture.NumberFormat))
             {
@@ -950,7 +953,7 @@ namespace SpreadSheetTasks
 
             if (!String.IsNullOrWhiteSpace(DocPropertyProgramName))
             {
-                var e2 = _excelArchiveFile.CreateEntry("docProps/app.xml", _clvl);
+                var e2 = _excelArchiveFile.CreateEntry("docProps/app.xml");
                 using var writer = new FormattingStreamWriter(e2.Open(), CultureInfo.InvariantCulture.NumberFormat);
                 writer.Write("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Properties ");
                 writer.Write("xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/extended-properties\" ");
@@ -972,7 +975,7 @@ namespace SpreadSheetTasks
                 writer.Write("</AppVersion></Properties>");
             }
 
-            var e3 = _excelArchiveFile.CreateEntry("xl/workbook.xml", _clvl);
+            var e3 = _excelArchiveFile.CreateEntry("xl/workbook.xml");
             using (var writer = new FormattingStreamWriter(e3.Open(), CultureInfo.InvariantCulture.NumberFormat))
             {
 
@@ -1008,7 +1011,7 @@ namespace SpreadSheetTasks
                 writer.Write("<calcPr calcId=\"124519\" fullCalcOnLoad=\"1\"/></workbook>");
             }
 
-            var e4 = _excelArchiveFile.CreateEntry("xl/_rels/workbook.xml.rels", _clvl);
+            var e4 = _excelArchiveFile.CreateEntry("xl/_rels/workbook.xml.rels");
             using (var writer = new FormattingStreamWriter(e4.Open(), CultureInfo.InvariantCulture.NumberFormat))
             {
                 writer.Write("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">");
@@ -1024,7 +1027,7 @@ namespace SpreadSheetTasks
                 writer.Write($"</Relationships>");
             }
 
-            var e5 = _excelArchiveFile.CreateEntry("_rels/.rels", _clvl);
+            var e5 = _excelArchiveFile.CreateEntry("_rels/.rels");
             using (var writer = new FormattingStreamWriter(e5.Open(), CultureInfo.InvariantCulture.NumberFormat))
             {
                 writer.Write("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
@@ -1048,7 +1051,7 @@ namespace SpreadSheetTasks
 
             if (!String.IsNullOrWhiteSpace(DocPropertyProgramName))
             {
-                var e6 = _excelArchiveFile.CreateEntry("docProps/core.xml", _clvl);
+                var e6 = _excelArchiveFile.CreateEntry("docProps/core.xml");
                 string stringNow = DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ssZ");
 
                 using var writer = new FormattingStreamWriter(e6.Open(), CultureInfo.InvariantCulture.NumberFormat);
@@ -1062,7 +1065,7 @@ namespace SpreadSheetTasks
                 writer.Write($"xsi:type=\"dcterms:W3CDTF\">{stringNow}</dcterms:modified></cp:coreProperties>");
             }
 
-            var e7 = _excelArchiveFile.CreateEntry("xl/styles.xml", _clvl);
+            var e7 = _excelArchiveFile.CreateEntry("xl/styles.xml");
             using (var writer = new FormattingStreamWriter(e7.Open(), CultureInfo.InvariantCulture.NumberFormat))
             {
                 writer.Write("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><styleSheet ");
@@ -1189,7 +1192,7 @@ namespace SpreadSheetTasks
 
             if (_useScharedStrings)
             {
-                var entry = _excelArchiveFile.CreateEntry("xl/sharedStrings.xml", _clvl);
+                var entry = _excelArchiveFile.CreateEntry("xl/sharedStrings.xml");
 
                 using var o = entry.Open();
                 using var _sharedStringWritter = new FormattingStreamWriter(o, Encoding.UTF8, bufferSize: _bufferSize, CultureInfo.InvariantCulture.NumberFormat);

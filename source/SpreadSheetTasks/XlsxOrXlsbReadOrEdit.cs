@@ -143,11 +143,15 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
         _mode = Modes.xlsx;
         if (updateMode)
         {
-            _xlsxArchive = new ZipArchive(new FileStream(path, FileMode.Open), ZipArchiveMode.Read | ZipArchiveMode.Update);
+            var updateStream = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+            _xlsxArchive = new ZipArchive(updateStream, ZipArchiveMode.Update);
         }
         else
         {
-            _xlsxArchive = new ZipArchive(new FileStream(path, FileMode.Open), ZipArchiveMode.Read);
+            // Read-only, shared access: the previous FileMode.Open overload requested ReadWrite
+            // and FileShare.None, which failed on read-only files and blocked concurrent readers.
+            var readStream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 64 * 1024);
+            _xlsxArchive = new ZipArchive(readStream, ZipArchiveMode.Read);
         }
 
         var e1 = _xlsxArchive.GetEntry("xl/workbook.xml");
@@ -199,7 +203,8 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
     private void OpenXlsb(string path, bool readSharedStrings = true)
     {
         _mode = Modes.xlsb;
-        _xlsxArchive = new ZipArchive(new FileStream(path, FileMode.Open), ZipArchiveMode.Read);
+        var readStream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 64 * 1024);
+        _xlsxArchive = new ZipArchive(readStream, ZipArchiveMode.Read);
 
         var e1 = _xlsxArchive.GetEntry("xl/workbook.bin");
 
@@ -928,7 +933,7 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
                             int numFormatId = s.NumFmtId;
 
                             if (_numberFormatsTypeDictionary.TryGetValue(numFormatId, out Type type) && type == typeof(DateTime?)
-                                && double.TryParse(_buffer.AsSpan(0, _len), NumberStyles.Any, provider: invariantCultureInfo, out double doubleDate)
+                                && double.TryParse(_buffer.AsSpan(0, _len), NumberStyles.Float, provider: invariantCultureInfo, out double doubleDate)
                                 //&& FastDoubleParser.TryParseDouble(_buffer.AsSpan(0, len), out double doubleDate)
                                 )
                             {
@@ -940,7 +945,7 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
                                 if (ContainsDoubleMarks(_buffer, _len))
                                 {
                                     valueX.type = ExcelDataType.Double;
-                                    valueX.doubleValue = double.Parse(_buffer.AsSpan(0, _len), provider: invariantCultureInfo);
+                                    valueX.doubleValue = double.Parse(_buffer.AsSpan(0, _len), NumberStyles.Float, provider: invariantCultureInfo);
                                     //valueX.doubleValue = FastDoubleParser.ParseDouble(_buffer.AsSpan(0, len));
                                 }
                                 else
@@ -955,7 +960,7 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
                             if (ContainsDoubleMarks(_buffer, _len))
                             {
                                 valueX.type = ExcelDataType.Double;
-                                valueX.doubleValue = double.Parse(_buffer.AsSpan(0, _len), provider: invariantCultureInfo);
+                                valueX.doubleValue = double.Parse(_buffer.AsSpan(0, _len), NumberStyles.Float, provider: invariantCultureInfo);
                                 //valueX.doubleValue = FastDoubleParser.ParseDouble(_buffer.AsSpan(0, len));
                             }
                             else
@@ -1229,7 +1234,8 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
     }
 
     //inspired by https://github.com/MarkPflug/Sylvan.Data.Excel
-    private readonly static char[] _buffer = new char[64];
+    //Per-instance: a shared static buffer would make concurrent readers overwrite each other's values.
+    private readonly char[] _buffer = new char[64];
 
     private static int ParseToUnsignedIntFromBuffer(char[] buff, int len)
     {
@@ -1274,7 +1280,7 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
         //    }
         //}
         //return false;
-        return buff.AsSpan(0,len).IndexOfAny('.', 'E') > 0;
+        return buff.AsSpan(0, len).IndexOfAny('.', 'e', 'E') >= 0;
     }
 
     /// <summary>Rows of an xlsx sheet. Each row is a new array, so rows can be kept (e.g. with ToList()).</summary>

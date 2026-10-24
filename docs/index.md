@@ -15,6 +15,7 @@
    - [Write with formatted cells](#write-with-formatted-cells)
    - [Write to Stream (MemoryStream / FileStream)](#write-to-stream)
    - [Write to Stream with custom buffer size](#write-to-stream-with-custom-buffer-size)
+   - [Compression level and inline XLSB strings](#compression-level-and-inline-xlsb-strings)
    - [Hidden sheets](#hidden-sheets)
    - [Events: OnCompress / On10k](#events-oncompress--on10k)
    - [Document properties](#document-properties)
@@ -47,7 +48,7 @@ dotnet add package SpreadSheetTasks
 ```
 
 ```xml
-<PackageReference Include="SpreadSheetTasks" Version="2.0.1" />
+<PackageReference Include="SpreadSheetTasks" Version="2.1.0" />
 ```
 
 ## Performance and NativeAOT
@@ -336,6 +337,34 @@ using (var writer = new XlsxWriter("large.xlsx", bufferSize: 65536))
 
 Both `XlsxWriter` and `XlsbWriter` accept `bufferSize` in their constructors (default: 4096).
 
+### Compression level and inline XLSB strings
+
+The default ZIP compression is **zlib level 3**, which balances write speed and
+file size (the same default as the JavaScript and Python libraries in
+`comparison/`). Seekable outputs use the library's own ZIP writer for that
+level; explicit `CompressionLevel` values and non-seekable streams use
+`System.IO.Compression.ZipArchive`:
+
+```csharp
+using System.IO.Compression;
+using SpreadSheetTasks;
+
+// Default: zlib level 3
+using (var writer = new XlsxWriter("default.xlsx")) { /* ... */ }
+
+// Explicit enum level: previous ZipArchive behaviour
+using (var writer = new XlsxWriter("fast.xlsx", _clvl: CompressionLevel.Fastest)) { /* ... */ }
+
+// XLSB: write strings inline instead of building a shared-string table
+using (var writer = new XlsbWriter("inline.xlsb", useSharedStrings: false)) { /* ... */ }
+```
+
+`useSharedStrings: false` avoids the per-workbook string dictionary and the
+final shared-string pass. It is usually the best choice when most text values
+are unique; repeated text produces a smaller file with the default
+`useSharedStrings: true`. On .NET 8 and on non-seekable streams, level 3 maps
+to the closest `CompressionLevel` enum value (typically `Optimal`).
+
 ### Hidden sheets
 
 ```csharp
@@ -444,6 +473,11 @@ using (var reader = new XlsxOrXlsbReadOrEdit())
     }
 }
 ```
+
+`Open` uses read-only, shared access (`FileAccess.Read`, `FileShare.Read`), so
+read-only files can be opened and several readers in the same process can read
+the same workbook concurrently. Pass `updateMode: true` only when the file must
+be modified; that mode requires write access and exclusive sharing.
 
 ### Read with typed getters
 
@@ -616,9 +650,17 @@ using (var reader = new XlsxOrXlsbReadOrEdit())
 
         // Or get the entire row as a ref to the internal buffer
         ref FieldInfo[] row = ref reader.GetNativeValues();
+
+        // Non-boxing span over the current row (valid until the next Read())
+        ReadOnlySpan<FieldInfo> current = reader.CurrentRow;
     }
 }
 ```
+
+`CurrentRow` is the preferred low-allocation API: it returns a
+`ReadOnlySpan<FieldInfo>` over the same per-instance buffer, with no
+`object[]` allocation and no boxing. Check `FieldInfo.type` before reading a
+union field.
 
 | `ExcelDataType` | Meaning | `FieldInfo` union field |
 |---|---|---|

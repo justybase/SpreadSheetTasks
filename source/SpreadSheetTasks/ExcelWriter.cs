@@ -372,7 +372,7 @@ namespace SpreadSheetTasks
         }
 
         internal Stream _newExcelFileStream;
-        internal ZipArchive _excelArchiveFile;
+        internal ExcelZipWriter _excelArchiveFile;
         internal List<(string name, string pathInArchive, string pathOnDisc, bool isHidden, string nameInArchive, int sheetId, string filterHeaderRange)> _sheetList = new();
 
         internal const int _MAX_WIDTH = 80;
