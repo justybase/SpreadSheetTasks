@@ -235,6 +235,34 @@ public class PerformanceRegressionTests
     [Theory]
     [InlineData(".xlsx")]
     [InlineData(".xlsb")]
+    public void Open_MemoryStream_ReadsWorkbook(string extension)
+    {
+        using var buffer = new MemoryStream();
+        ExcelWriter writer = extension == ".xlsx"
+            ? new XlsxWriter(buffer)
+            : new XlsbWriter(buffer);
+        using (writer)
+        {
+            writer.AddSheet("Sheet1");
+            writer.WriteSheet(CreateTypedData().CreateDataReader());
+        }
+
+        using var reader = new XlsxOrXlsbReadOrEdit();
+        using var input = new MemoryStream(buffer.ToArray(), writable: false);
+        reader.Open(input);
+        reader.ActualSheetName = "Sheet1";
+
+        Assert.True(reader.Read());
+        Assert.Equal("Id", reader.GetValue(0));
+        Assert.True(reader.Read());
+        Assert.Equal(1L, Convert.ToInt64(reader.GetValue(0)));
+        Assert.Equal("Alpha", reader.GetValue(1));
+        Assert.Equal(ExcelDataType.DateTime, reader.GetExcelDataType(3));
+    }
+
+    [Theory]
+    [InlineData(".xlsx")]
+    [InlineData(".xlsb")]
     public void Writer_NonSeekableStream_FallsBackToZipArchive(string extension)
     {
         string path = $"test_non_seekable_{Guid.NewGuid():N}{extension}";

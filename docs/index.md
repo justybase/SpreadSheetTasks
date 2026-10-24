@@ -22,6 +22,7 @@
    - [SuppressYear1000Dates](#suppressyear1000dates)
 3. [Reading Excel Files](#reading-excel-files)
    - [Basic read](#basic-read)
+   - [Read from a stream](#read-from-a-stream)
    - [Read with typed getters](#read-with-typed-getters)
    - [GetRowsOfSheet](#getrowsofsheet)
    - [Get sheet names](#get-sheet-names)
@@ -478,6 +479,28 @@ using (var reader = new XlsxOrXlsbReadOrEdit())
 read-only files can be opened and several readers in the same process can read
 the same workbook concurrently. Pass `updateMode: true` only when the file must
 be modified; that mode requires write access and exclusive sharing.
+
+### Read from a stream
+
+`Open(Stream)` accepts any seekable stream and detects XLSX/XLSB from the
+package entries. The reader takes ownership of the stream and disposes it with
+the reader. This is useful for in-memory data, cloud downloads or benchmarks
+that should not measure disk I/O:
+
+```csharp
+using SpreadSheetTasks;
+
+byte[] bytes = File.ReadAllBytes("data.xlsx");
+using var input = new MemoryStream(bytes, writable: false);
+using var reader = new XlsxOrXlsbReadOrEdit();
+reader.Open(input); // format detected from xl/workbook.xml or xl/workbook.bin
+reader.ActualSheetName = "Sheet1";
+
+while (reader.Read())
+{
+    string name = reader.GetString(0);
+}
+```
 
 ### Read with typed getters
 

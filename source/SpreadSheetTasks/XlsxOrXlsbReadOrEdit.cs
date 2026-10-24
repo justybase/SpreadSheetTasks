@@ -154,6 +154,11 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
             _xlsxArchive = new ZipArchive(readStream, ZipArchiveMode.Read);
         }
 
+        OpenXlsxArchive(readSharedStrings);
+    }
+
+    private void OpenXlsxArchive(bool readSharedStrings)
+    {
         var e1 = _xlsxArchive.GetEntry("xl/workbook.xml");
         using (var str = e1.Open())
         {
@@ -206,6 +211,11 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
         var readStream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 64 * 1024);
         _xlsxArchive = new ZipArchive(readStream, ZipArchiveMode.Read);
 
+        OpenXlsbArchive(readSharedStrings);
+    }
+
+    private void OpenXlsbArchive(bool readSharedStrings)
+    {
         var e1 = _xlsxArchive.GetEntry("xl/workbook.bin");
 
         BiffReaderWriter reader;
@@ -274,7 +284,52 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
         else
         {
             _mode = Modes.xlsx;
-            OpenXlsx(path, updateMode: updateMode);
+            OpenXlsx(path, readSharedStrings, updateMode);
+        }
+    }
+
+    /// <summary>
+    /// Initializes the reader from a seekable stream containing an XLSX or XLSB workbook.
+    /// The format is detected from the package entries (<c>xl/workbook.bin</c> or
+    /// <c>xl/workbook.xml</c>). The reader takes ownership of the stream and disposes it
+    /// together with the archive.
+    /// </summary>
+    /// <param name="stream">Seekable stream with the workbook bytes.</param>
+    /// <param name="readSharedStrings">If false, the shared-string table is not loaded.</param>
+    /// <param name="updateMode">If true, the package is opened for update; the stream must be writable.</param>
+    /// <param name="encoding">Reserved for compatibility with the path overload.</param>
+    public void Open(Stream stream, bool readSharedStrings = true, bool updateMode = false, Encoding? encoding = null)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+        if (!stream.CanRead) throw new ArgumentException("The stream must be readable.", nameof(stream));
+        if (!stream.CanSeek) throw new ArgumentException("The stream must be seekable.", nameof(stream));
+        if (updateMode && !stream.CanWrite) throw new ArgumentException("Update mode requires a writable stream.", nameof(stream));
+
+        var archive = new ZipArchive(stream, updateMode ? ZipArchiveMode.Update : ZipArchiveMode.Read, leaveOpen: false);
+        try
+        {
+            if (archive.GetEntry("xl/workbook.bin") is not null)
+            {
+                _xlsxArchive = archive;
+                _mode = Modes.xlsb;
+                OpenXlsbArchive(readSharedStrings);
+            }
+            else if (archive.GetEntry("xl/workbook.xml") is not null)
+            {
+                _xlsxArchive = archive;
+                _mode = Modes.xlsx;
+                OpenXlsxArchive(readSharedStrings);
+            }
+            else
+            {
+                throw new InvalidDataException("The stream is not an XLSX or XLSB workbook.");
+            }
+        }
+        catch
+        {
+            archive.Dispose();
+            _xlsxArchive = null!;
+            throw;
         }
     }
 
