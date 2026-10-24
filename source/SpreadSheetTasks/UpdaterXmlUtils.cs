@@ -203,6 +203,18 @@ internal static class UpdaterXmlUtils
         }
     }
 
+    private static readonly Regex XstringEscapeRegex = new(@"_x([0-9A-Fa-f]{4})_", RegexOptions.CultureInvariant);
+
+    /// <summary>
+    /// Escapes shared/inline string text. A literal <c>_xHHHH_</c> is written as <c>_x005F_xHHHH_</c>
+    /// because Excel decodes that pattern in these elements (ECMA-376 ST_Xstring).
+    /// </summary>
+    internal static string EscapeXlsxText(string value)
+    {
+        ArgumentNullException.ThrowIfNull(value);
+        return EscapeXmlText(value.IndexOf('_') < 0 ? value : XstringEscapeRegex.Replace(value, "_x005F_x$1_"));
+    }
+
     internal static string EscapeXmlText(string value)
     {
         ArgumentNullException.ThrowIfNull(value);
@@ -231,6 +243,8 @@ internal static class UpdaterXmlUtils
                 case '>': builder.Append("&gt;"); break;
                 case '"': builder.Append("&quot;"); break;
                 case '\'': builder.Append("&apos;"); break;
+                // Raw CR is normalized to LF by XML parsers; keep it as a character reference.
+                case '\r': builder.Append("&#13;"); break;
                 default: builder.Append(character); break;
             }
         }
@@ -258,7 +272,7 @@ internal static class UpdaterXmlUtils
 
     internal static string BuildSharedStringItem(string value)
     {
-        string escaped = EscapeXmlText(value);
+        string escaped = EscapeXlsxText(value);
         string preserve = ShouldPreserveWhitespace(value) ? " xml:space=\"preserve\"" : string.Empty;
         return $"<si><t{preserve}>{escaped}</t></si>";
     }

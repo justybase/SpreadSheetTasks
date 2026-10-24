@@ -252,9 +252,23 @@ namespace SpreadSheetTasks
             _currentBufferOffset += val.Length;
         }
 
+        /// <summary>True when <paramref name="val"/> has an ST_Xstring escape <c>_xHHHH_</c> starting at <paramref name="i"/>.</summary>
+        private static bool IsXstringEscapeAt(ReadOnlySpan<char> val, int i)
+        {
+            if (i + 7 > val.Length || val[i + 1] != 'x' || val[i + 6] != '_')
+            {
+                return false;
+            }
+            for (int k = i + 2; k < i + 6; k++)
+            {
+                if (!Uri.IsHexDigit(val[k])) return false;
+            }
+            return true;
+        }
+
         private void WriteXmlEscapedToBuffer(ReadOnlySpan<char> val)
         {
-            int specialIdx = val.IndexOfAny(['&', '<', '>', '"', '\'']);
+            int specialIdx = val.IndexOfAny(['&', '<', '>', '"', '\'', '\r', '_']);
             if (specialIdx < 0)
             {
                 val.CopyTo(_buffer.AsSpan(_currentBufferOffset));
@@ -290,6 +304,15 @@ namespace SpreadSheetTasks
                         break;
                     case '\'':
                         "&apos;".CopyTo(_buffer.AsSpan(_currentBufferOffset));
+                        _currentBufferOffset += 6;
+                        break;
+                    case '\r':
+                        "&#13;".CopyTo(_buffer.AsSpan(_currentBufferOffset));
+                        _currentBufferOffset += 5;
+                        break;
+                    case '_' when IsXstringEscapeAt(val, i):
+                        // Only the underscore changes: `_x0041_` becomes `_x005F_x0041_`.
+                        "_x005F".CopyTo(_buffer.AsSpan(_currentBufferOffset));
                         _currentBufferOffset += 6;
                         break;
                     default:
@@ -602,6 +625,47 @@ namespace SpreadSheetTasks
             pendingNullStart = -1;
         }
 
+        /// <summary>
+        /// Writes a value of an untyped column with the type it actually has. Returns false for values
+        /// that are written as text (the caller handles those).
+        /// </summary>
+        private bool TryWriteObjectValueCell(object value, bool hasGap, int column, int rowNumber, CellStyle? cellStyle)
+        {
+            switch (value)
+            {
+                case bool bVal:
+                    WriteCellStart(hasGap, column, rowNumber, cellStyle is not null ? RegisterStyle(cellStyle) : -1);
+                    WriteStringToBuffer(" t=\"b\"><v>");
+                    _buffer[_currentBufferOffset++] = bVal ? '1' : '0';
+                    WriteStringToBuffer("</v></c>");
+                    return true;
+                case DateTime dtVal:
+                    WriteCellStart(hasGap, column, rowNumber, cellStyle is not null ? RegisterStyle(cellStyle, NumFmtIdDateTime) : XfStyleDateTime);
+                    WriteStringToBuffer("><v>");
+                    WriteDoubleToBuffer(dtVal.ToOADate());
+                    WriteStringToBuffer("</v></c>");
+                    if (!_inMemoryMode)
+                    {
+                        _colWidthsArray[column] = _dateTimeWidth;
+                    }
+                    return true;
+                case int or long or short or byte or sbyte or ushort or uint or ulong:
+                    WriteCellStart(hasGap, column, rowNumber, cellStyle is not null ? RegisterStyle(cellStyle) : -1);
+                    WriteStringToBuffer("><v>");
+                    WriteInt64ToBuffer(Convert.ToInt64(value, CultureInfo.InvariantCulture));
+                    WriteStringToBuffer("</v></c>");
+                    return true;
+                case float or double or decimal:
+                    WriteCellStart(hasGap, column, rowNumber, cellStyle is not null ? RegisterStyle(cellStyle) : -1);
+                    WriteStringToBuffer("><v>");
+                    WriteDoubleToBuffer(Convert.ToDouble(value, CultureInfo.InvariantCulture));
+                    WriteStringToBuffer("</v></c>");
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
         private void WriteRow(int columnCount, int rowNumber, Dictionary<int, CellStyle>? rowStyles, bool boldedStyle = false)
         {
             int lastWrittenColumn = -1;
@@ -641,6 +705,14 @@ namespace SpreadSheetTasks
                         ? RegisterStyle(CellStyle.Merge(cellStyle, new CellStyle { NumberFormat = fc.Format }))
                         : RegisterFormat(fc.Format);
                     WriteFormattedCell(innerVal, fmtXfIndex, column, rowNumber, hasGap);
+                    lastWrittenColumn = column;
+                    continue;
+                }
+
+                // Untyped (object) columns: numbers, dates and booleans keep their own type. Text stays text.
+                if (_newTypes[column] == TypeCode.Object && typesArray[column] != 5 && rawVal is not string
+                    && TryWriteObjectValueCell(rawVal, hasGap, column, rowNumber, cellStyle))
+                {
                     lastWrittenColumn = column;
                     continue;
                 }
@@ -1127,21 +1199,51 @@ namespace SpreadSheetTasks
 
                 foreach (string dana in _sstDic.Keys)
                 {
+                    string escaped = EscapeXmlText(dana);
                     if (ShouldPreserveWhitespace(dana))
                     {
                         _sharedStringWritter.Write("<si><t xml:space=\"preserve\">");
-                        _sharedStringWritter.Write(dana);
+                        _sharedStringWritter.Write(escaped);
                         _sharedStringWritter.Write("</t></si>");
                     }
                     else
                     {
                         _sharedStringWritter.Write("<si><t>");
-                        _sharedStringWritter.Write(dana);
+                        _sharedStringWritter.Write(escaped);
                         _sharedStringWritter.Write("</t></si>");
                     }
                 }
                 _sharedStringWritter.Write("</sst>");
             }
+        }
+
+        /// <summary>Escapes the characters that are not allowed raw in XML text (and attribute values).</summary>
+        private static readonly char[] XmlSpecialChars = { '&', '<', '>', '"', '\'', '\r' };
+
+        private static readonly System.Text.RegularExpressions.Regex XstringEscapeRegex =
+            new(@"_x([0-9A-Fa-f]{4})_", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+
+        /// <summary>
+        /// Escapes shared/inline string text. Raw CR is written as <c>&amp;#13;</c> (parsers would turn it into LF),
+        /// and a literal <c>_xHHHH_</c> becomes <c>_x005F_xHHHH_</c> because Excel decodes that pattern (ST_Xstring).
+        /// </summary>
+        private static string EscapeXmlText(string value)
+        {
+            if (value.IndexOf('_') >= 0)
+            {
+                value = XstringEscapeRegex.Replace(value, "_x005F_x$1_");
+            }
+            if (value.IndexOfAny(XmlSpecialChars) < 0)
+            {
+                return value;
+            }
+            return value
+                .Replace("&", "&amp;")
+                .Replace("<", "&lt;")
+                .Replace(">", "&gt;")
+                .Replace("\"", "&quot;")
+                .Replace("'", "&apos;")
+                .Replace("\r", "&#13;");
         }
 
         private static bool ShouldPreserveWhitespace(string value)
@@ -1201,7 +1303,7 @@ namespace SpreadSheetTasks
 
             for (int j = 0; j < colCnt; j++)
             {
-                string stringValue = reader.GetName(j);
+                string stringValue = EscapeXmlText(reader.GetName(j));
                 sheetWritter.Write("<c r=\"");
                 sheetWritter.Write(_letters[j + startingColumn]);
                 sheetWritter.Write((rowNum + 1 + startingRow));
@@ -1237,26 +1339,7 @@ namespace SpreadSheetTasks
  
                         string stringValue = rawValue.ToString()!;
 
-                        if (stringValue.Contains('&'))
-                        {
-                            stringValue = stringValue.Replace("&", "&amp;");
-                        }
-                        if (stringValue.Contains('<'))
-                        {
-                            stringValue = stringValue.Replace("<", "&lt;");
-                        }
-                        if (stringValue.Contains('>'))
-                        {
-                            stringValue = stringValue.Replace(">", "&gt;");
-                        }
-                        if (stringValue.Contains('\"'))
-                        {
-                            stringValue = stringValue.Replace("\"", "&quot;");
-                        }
-                        if (stringValue.Contains('\''))
-                        {
-                            stringValue = stringValue.Replace("'", "&apos;");
-                        }
+                        stringValue = EscapeXmlText(stringValue);
 
                         sheetWritter.Write("<c r=\"");
                         sheetWritter.Write(_letters[j + startingColumn]);

@@ -483,10 +483,14 @@ namespace SpreadSheetTasks
                     var stringValue = Encoding.UTF8.GetString(((Memory<byte>)(_dataColReader.GetValue(column))).Span);
                     WriteString(stringValue, column, boldedStyle, styleXf);
                 }
-                else if(_newTypes[column] == TypeCode.Object)
+                else if (_newTypes[column] == TypeCode.Object)
                 {
-                    string stringValue = _dataColReader.GetValue(column).ToString();
-                    WriteString(stringValue, column, bolded: false, styleOverride: styleXf);
+                    // Untyped column: numbers, dates and booleans keep their own type; everything else is text.
+                    if (!TryWriteObjectValue(rawVal, column, cellStyle))
+                    {
+                        string stringValue = rawVal.ToString()!;
+                        WriteString(stringValue, column, bolded: false, styleOverride: styleXf);
+                    }
                 }
                 else if (_newTypes[column] == TypeCode.Boolean) // bool
                 {
@@ -563,6 +567,26 @@ namespace SpreadSheetTasks
             if (!wroteAnyCell)
             {
                 WriteBlank(0, boldedStyle ? XfStyleBoldHeader : 0);
+            }
+        }
+
+        /// <summary>Writes a value of an untyped column with its own type. Returns false for text values.</summary>
+        private bool TryWriteObjectValue(object value, int column, CellStyle? cellStyle)
+        {
+            int styleNum = cellStyle is not null ? RegisterStyle(cellStyle) : 0;
+            switch (value)
+            {
+                case bool bVal:
+                    WriteBool(bVal, column, styleNum);
+                    return true;
+                case DateTime dtVal:
+                    WriteDateTime(dtVal, column, cellStyle is not null ? RegisterStyle(cellStyle, NumFmtIdDateTime) : XfStyleDateTime);
+                    return true;
+                case int or long or short or byte or sbyte or ushort or uint or ulong or float or double or decimal:
+                    WriteDouble(Convert.ToDouble(value), column, styleNum);
+                    return true;
+                default:
+                    return false;
             }
         }
 

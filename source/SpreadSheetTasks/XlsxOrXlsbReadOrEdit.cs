@@ -15,6 +15,22 @@ namespace SpreadSheetTasks;
 
 public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
 {
+    private static readonly System.Text.RegularExpressions.Regex XstringRegex =
+        new(@"_x([0-9A-Fa-f]{4})_", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+
+    /// <summary>
+    /// Decodes ST_Xstring escapes (<c>_xHHHH_</c>) that Excel writes in shared and inline strings,
+    /// for example CR as <c>_x000D_</c>. XML line-end normalization is already done by XmlReader.
+    /// </summary>
+    private static string DecodeXstring(string value)
+    {
+        if (value is null || value.IndexOf('_') < 0)
+        {
+            return value!;
+        }
+        return XstringRegex.Replace(value, match => ((char)Convert.ToInt32(match.Groups[1].Value, 16)).ToString());
+    }
+
     private ZipArchive _xlsxArchive;
     private readonly Dictionary<string, string> _worksheetIdToName = [];
     private readonly Dictionary<string, string> _worksheetNameToId = [];
@@ -53,28 +69,44 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
         { 44,typeof(decimal?)}
     };
 
-    internal readonly static HashSet<string> _dateExcelMasks = new HashSet<string>()
+    /// <summary>
+    /// True when the first section of an Excel number-format code holds a date or time token.
+    /// Quoted text, escaped characters and [bracketed] blocks (colour, locale) are skipped, so custom
+    /// formats such as <c>yyyy-mm-dd</c> or <c>[$-415]d mmmm yyyy</c> are recognised without a fixed list.
+    /// </summary>
+    internal static bool IsDateFormatCode(string? formatCode)
     {
-        @"[$-F800]dddd\,\ mmmm\ dd\,\ yyyy",
-        @"d\-mm;@",
-        @"yy\-mm\-dd;@",
-        @"[$-415]d\ mmm;@",
-        @"[$-415]d\ mmm\ yy;@",
-        @"[$-415]dd\ mmm\ yy;@",
-        @"[$-415]mmm\ yy;@",
-        @"[$-415]mmmm\ yy;@",
-        @"[$-415]d\ mmmm\ yyyy;@",
-        @"yyyy\-mm\-dd\ hh:mm",
-        @"yyyy\-mm\-dd\ hh:mm:ss",
-        @"yyyy\-mm\-dd;@",
-        @"[$-409]dd\-mm\-yy\ h:mm\ AM/PM;@",
-        @"dd\-mm\-yy\ h:mm;@",
-        @"[$-415]mmmmm;@",
-        @"[$-415]mmmmm\.yy;@",
-        @"\-m\-yyyy;@",
-        @"[$-415]d\-mmm\-yyyy;@",
-        @"d\-m\-yyyy;@"
-    };
+        if (string.IsNullOrEmpty(formatCode))
+        {
+            return false;
+        }
+
+        bool hasDateToken = false;
+        for (int i = 0; i < formatCode.Length; i++)
+        {
+            char c = formatCode[i];
+            switch (c)
+            {
+                case '"':
+                    i = formatCode.IndexOf('"', i + 1);
+                    if (i < 0) return hasDateToken;
+                    break;
+                case '\\':
+                    i++;
+                    break;
+                case '[':
+                    i = formatCode.IndexOf(']', i + 1);
+                    if (i < 0) return hasDateToken;
+                    break;
+                case ';':
+                    return hasDateToken;
+                case 'y' or 'Y' or 'd' or 'D' or 'm' or 'M' or 'h' or 'H' or 's' or 'S':
+                    hasDateToken = true;
+                    break;
+            }
+        }
+        return hasDateToken;
+    }
 
     private string _sharedStringsLocation = null;
     private string _stylesLocation = null;
@@ -374,7 +406,7 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
                     reader.Read();
                     if (reader.IsStartElement("t"))
                     {
-                        string vall = reader.ReadElementContentAsString();
+                        string vall = DecodeXstring(reader.ReadElementContentAsString());
                         // si -> t->  t -> value
                         //string vall = reader.Value;
 
@@ -503,7 +535,7 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
 
                             if (!_numberFormatsTypeDictionary.TryGetValue(numFmtId, out var type))
                             {
-                                if (_dateExcelMasks.Contains(formatCode))
+                                if (IsDateFormatCode(formatCode))
                                 {
                                     type = typeof(DateTime?);
                                 }
@@ -576,7 +608,7 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
 
                     if (!_numberFormatsTypeDictionary.TryGetValue(numFmtId, out var type))
                     {
-                        if (_dateExcelMasks.Contains(formatCode))
+                        if (IsDateFormatCode(formatCode))
                         {
                             type = typeof(DateTime?);
                         }
@@ -610,6 +642,8 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
     private int _prevRowNum = -1;
     private bool _isFirstRow = true;
     private int _columnsCntFromFirstRow = -1;
+    // Width (in columns) of the row being read. A row can be wider than the first row.
+    private int _rowWidth;
     private int _numberOfFirstColumnWithData = -1;
     private int _numberOfLastColumnWithData = -1;
     private int _colNum = -1;
@@ -730,7 +764,7 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
         //empty row/s
         if (_prevRowNum != -1 && _rowNum > _prevRowNum + 1)
         {
-            for (int i = 0; i < _columnsCntFromFirstRow; i++)
+            for (int i = 0; i < innerRow.Length; i++)
             {
                 innerRow[i].type = ExcelDataType.Null;
             }
@@ -743,12 +777,13 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
         _prevRowNum = _rowNum;
         
         // Clear innerRow for the new row - set all cells to Null
-        for (int i = 0; i < _columnsCntFromFirstRow; i++)
+        for (int i = 0; i < innerRow.Length; i++)
         {
             innerRow[i].type = ExcelDataType.Null;
         }
 
         _prevColNum = -1;
+        _rowWidth = 0;
         int cellIndex = 0; // Track cell position sequentially
         while (_xmlReader.Read() && _xmlReader.IsStartElement("c"))
         {
@@ -805,6 +840,7 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
             }
 
             int _tmpLen = ResizeRowIfNeeded();
+            _rowWidth = Math.Max(_rowWidth, _tmpLen + 1);
             ref FieldInfo valueX = ref innerRow[_tmpLen];
 
             bool isEmptyElement = _xmlReader.IsEmptyElement;
@@ -838,7 +874,7 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
                     _xmlReader.Read();
                     _xmlReader.Read();
                     valueX.type = ExcelDataType.String;
-                    valueX.strValue = _xmlReader.ReadContentAsString();
+                    valueX.strValue = DecodeXstring(_xmlReader.ReadContentAsString());
                 }
                 else if (_xmlReader.ReadToDescendant("v"))
                 {
@@ -955,6 +991,10 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
             Array.Resize<FieldInfo>(ref innerRow, _columnsCntFromFirstRow);
             FieldCount = _columnsCntFromFirstRow;
         }
+        if (_rowWidth > FieldCount)
+        {
+            FieldCount = _rowWidth;
+        }
         return true;
     }
 
@@ -1005,6 +1045,8 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
         //last row is not complete
         if (!_isFirstRow && _colNum > _numberOfFirstColumnWithData)
         {
+            // The row buffer was sized from the first row; a later sparse row can be wider.
+            ResizeRowIfNeeded();
             for (int i = _numberOfFirstColumnWithData; i < _colNum; i++)
             {
                 innerRow[i - _numberOfFirstColumnWithData].type = ExcelDataType.Null;
@@ -1022,7 +1064,7 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
         //missing rows
         if (_prevRowNum != -1 && _rowNum > _prevRowNum + 1)
         {
-            for (int i = 0; i < _columnsCntFromFirstRow; i++)
+            for (int i = 0; i < innerRow.Length; i++)
             {
                 innerRow[i].type = ExcelDataType.Null;
             }
@@ -1034,10 +1076,11 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
         _prevRowNum = _rowNum;
 
         // Clear innerRow for the new row - set all cells to Null
-        for (int i = 0; i < _columnsCntFromFirstRow; i++)
+        for (int i = 0; i < innerRow.Length; i++)
         {
             innerRow[i].type = ExcelDataType.Null;
         }
+        _rowWidth = 0;
 
         while (_rowNum == _prevRowNum && _returnValue)
         {
@@ -1056,6 +1099,7 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
                 }
 
                 int _tmpLen = ResizeRowIfNeeded();
+                _rowWidth = Math.Max(_rowWidth, _tmpLen + 1);
                 ref FieldInfo valueX = ref innerRow[_tmpLen];
 
                 valueX.type = ExcelDataType.String;
@@ -1164,6 +1208,10 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
             _isFirstRow = false;
             Array.Resize(ref innerRow, _columnsCntFromFirstRow);
         }
+        if (_rowWidth > FieldCount)
+        {
+            FieldCount = _rowWidth;
+        }
 
         return true;
     }
@@ -1229,48 +1277,54 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
         return buff.AsSpan(0,len).IndexOfAny('.', 'E') > 0;
     }
 
-    public IEnumerable<object[]> GetRowsOfXlsx(string sheetName)
-    {
-        ActualSheetName = sheetName;
-        Read();
-        object[] row = new object[FieldCount];
-        GetValues(row);
-        yield return row;
+    /// <summary>Rows of an xlsx sheet. Each row is a new array, so rows can be kept (e.g. with ToList()).</summary>
+    public IEnumerable<object[]> GetRowsOfXlsx(string sheetName) => ReadRows(sheetName, isXlsx: true, reuseBuffer: false);
 
-        while (ReadXlsx())
-        {
-            GetValues(row);
-            yield return row;
-        }
-    }
+    /// <summary>Rows of an xlsb sheet. Each row is a new array, so rows can be kept (e.g. with ToList()).</summary>
+    public IEnumerable<object[]> GetRowsOfXlsb(string sheetName) => ReadRows(sheetName, isXlsx: false, reuseBuffer: false);
 
-    public IEnumerable<object[]> GetRowsOfXlsb(string sheetName)
-    {
-        ActualSheetName = sheetName;
-        Read();
-        object[] row = new object[FieldCount];
-        GetValues(row);
-        yield return row;
-
-        while (ReadXlsb())
-        {
-            GetValues(row);
-            yield return row;
-        }
-    }
-
+    /// <summary>
+    /// Rows of the sheet. Each row is a new array, so rows can be kept (e.g. with ToList()).
+    /// For a faster read-only scan that reuses one array, use <see cref="GetRowsOfSheetReadOnly"/>.
+    /// </summary>
     public IEnumerable<object[]> GetRowsOfSheet(string sheetName)
     {
         ArgumentNullException.ThrowIfNull(sheetName);
         ArgumentException.ThrowIfNullOrWhiteSpace(sheetName);
 
-        if (_mode == Modes.xlsx)
+        return ReadRows(sheetName, isXlsx: _mode == Modes.xlsx, reuseBuffer: false);
+    }
+
+    /// <summary>
+    /// Read-only scan of the sheet that reuses one <c>object[]</c> for every row (fastest; no per-row allocation).
+    /// The array is overwritten on the next iteration: consume each row before moving on, and do not keep
+    /// references to it (ToList(), ToArray() and similar will all contain the same, last-read values).
+    /// </summary>
+    public IEnumerable<object[]> GetRowsOfSheetReadOnly(string sheetName)
+    {
+        ArgumentNullException.ThrowIfNull(sheetName);
+        ArgumentException.ThrowIfNullOrWhiteSpace(sheetName);
+
+        return ReadRows(sheetName, isXlsx: _mode == Modes.xlsx, reuseBuffer: true);
+    }
+
+    private IEnumerable<object[]> ReadRows(string sheetName, bool isXlsx, bool reuseBuffer)
+    {
+        ActualSheetName = sheetName;
+        Read();
+        object[] row = new object[FieldCount];
+        GetValues(row);
+        yield return row;
+
+        while (isXlsx ? ReadXlsx() : ReadXlsb())
         {
-            return GetRowsOfXlsx(sheetName);
-        }
-        else
-        {
-            return GetRowsOfXlsb(sheetName);
+            // Copies always get the current width; a reused buffer is replaced only when a row became wider.
+            if (!reuseBuffer || row.Length < FieldCount)
+            {
+                row = new object[FieldCount];
+            }
+            GetValues(row);
+            yield return row;
         }
     }
 

@@ -851,7 +851,7 @@ public sealed class XlsxUpdater : IDisposable
         if (_sharedStrings is null)
         {
             string preserve = UpdaterXmlUtils.ShouldPreserveWhitespace(value) ? " xml:space=\"preserve\"" : string.Empty;
-            string escaped = UpdaterXmlUtils.EscapeXmlText(value);
+            string escaped = UpdaterXmlUtils.EscapeXlsxText(value);
             return $"<{cellPrefix}c r=\"{reference}\" t=\"inlineStr\"{styleAttribute}><{cellPrefix}is><{cellPrefix}t{preserve}>{escaped}</{cellPrefix}t></{cellPrefix}is></{cellPrefix}c>";
         }
 

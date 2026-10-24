@@ -1,5 +1,6 @@
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
+using SpreadSheetTasks;
 
 namespace Tests;
 
@@ -7,19 +8,95 @@ namespace Tests;
 [SupportedOSPlatform("windows")]
 public class ExcelComValidation
 {
-    private static readonly string OutputDir = ResolveTestOutputDir();
+    private string _outputDir = string.Empty;
 
-    private static string ResolveTestOutputDir()
+    // Fixtures are written by the library under test into a fresh temp folder, so the test
+    // does not depend on files left in test_output by other runs.
+    private static string CreateFixtures()
     {
-        var dir = new DirectoryInfo(AppContext.BaseDirectory);
-        while (dir != null)
+        string dir = Path.Combine(Path.GetTempPath(), "sst-excel-com-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        foreach (string ext in new[] { ".xlsx", ".xlsb" })
+            WriteFixtures(dir, ext);
+        return dir;
+    }
+
+    private static void WriteFixtures(string dir, string ext)
+    {
+        Write(dir, "01_basic_datatable" + ext, w =>
         {
-            var testOutput = new DirectoryInfo(Path.Combine(dir.FullName, "test_output"));
-            if (testOutput.Exists)
-                return testOutput.FullName;
-            dir = dir.Parent;
-        }
-        throw new DirectoryNotFoundException("Cannot find test_output directory.");
+            w.AddSheet("Data");
+            w.WriteSheet(new object?[][] { [1, "Widget", 9.99], [2, "Gadget", 4.5], [3, "Doohickey", 0.49] },
+                ["ID", "Name", "Price"], doAutofilter: true);
+        });
+        Write(dir, "03_all_types" + ext, w =>
+        {
+            w.AddSheet("Types");
+            w.WriteSheet(new object?[][]
+            {
+                ["Hello", 42, 3.14, true, new DateTime(2024, 3, 5), 123.45],
+                ["World", 7, 2.71, false, new DateTime(2024, 3, 6), 1.5],
+            }, ["Text", "Int", "Double", "Bool", "Date", "Money"]);
+        });
+        Write(dir, "04_multi_sheet" + ext, w =>
+        {
+            w.AddSheet("X");
+            w.WriteSheet(new object?[][] { [1], [2] }, ["X"]);
+            w.AddSheet("Y");
+            w.WriteSheet(new object?[][] { ["aaa"], ["bbb"] }, ["Y"]);
+        });
+        Write(dir, "05_no_headers" + ext, w =>
+        {
+            w.AddSheet("Data");
+            w.WriteSheet(new object?[][] { [100, "data"] }, headers: false, doAutofilter: true);
+        });
+        Write(dir, "06_starting_row_col" + ext, w =>
+        {
+            w.AddSheet("Data");
+            w.WriteSheet(new object?[][] { [1], [2] }, ["A"], startingRow: 3, startingColumn: 2, doAutofilter: true);
+        });
+        Write(dir, "09_autofilter" + ext, w =>
+        {
+            w.AddSheet("Data");
+            w.WriteSheet(new object?[][] { ["NYC", 100], ["LA", 200], ["Chicago", 150] },
+                ["City", "Sales"], doAutofilter: true);
+        });
+        Write(dir, "10_reader_from_list" + ext, w =>
+        {
+            w.AddSheet("Data");
+            w.WriteSheet(new object?[][] { [1, "Alice", true], [2, "Bob", false], [3, "Charlie", true] },
+                ["ID", "Name", "Active"], doAutofilter: true);
+        });
+        Write(dir, "15_booleans" + ext, w =>
+        {
+            w.AddSheet("Data");
+            w.WriteSheet(new object?[][] { [true, "Yes"], [false, "No"], [true, "On"] },
+                ["Flag", "Label"], doAutofilter: true);
+        });
+        Write(dir, "16_null_values" + ext, w =>
+        {
+            w.AddSheet("Data");
+            w.WriteSheet(new object?[][] { ["A", 1, 1.1], [null, null, null], ["C", 3, null] },
+                ["Col1", "Col2", "Col3"], doAutofilter: true);
+        });
+        Write(dir, "17_object_array" + ext, w =>
+        {
+            w.AddSheet("Data");
+            w.WriteSheet(new object?[][] { [1, "Alice", 100.5], [2, "Bob", 200.0], [3, "Charlie", 300.25] },
+                ["ID", "Name", "Value"], doAutofilter: true);
+        });
+    }
+
+    private static void Write(string dir, string fileName, Action<ExcelWriter> build)
+    {
+        using var writer = ExcelWriter.CreateWriter(Path.Combine(dir, fileName));
+        build(writer);
+    }
+
+    private static void DeleteFixtures(string dir)
+    {
+        try { Directory.Delete(dir, recursive: true); }
+        catch (IOException) { }
     }
 
     private static bool IsExcelInstalled()
@@ -55,7 +132,7 @@ public class ExcelComValidation
 
     private void CheckFile(List<string> errors, string fileName, Action<dynamic> assert)
     {
-        var path = Path.Combine(OutputDir, fileName);
+        var path = Path.Combine(_outputDir, fileName);
         if (!File.Exists(path)) { errors.Add($"Missing: {fileName}"); return; }
 
         dynamic? wb = null;
@@ -98,7 +175,8 @@ public class ExcelComValidation
             return;
         }
 
-        var files = Directory.GetFiles(OutputDir, "*.xls?")
+        _outputDir = CreateFixtures();
+        var files = Directory.GetFiles(_outputDir, "*.xls?")
             .OrderBy(f => Path.GetFileName(f))
             .ToArray();
         Assert.NotEmpty(files);
@@ -128,7 +206,7 @@ public class ExcelComValidation
             if (failed > 0)
                 Assert.Fail($"Excel open: {passed} passed, {failed} failed\n" + string.Join("\n", errors));
         }
-        finally { Stop(); }
+        finally { Stop(); DeleteFixtures(_outputDir); }
     }
 
     [Fact]
@@ -140,6 +218,7 @@ public class ExcelComValidation
             return;
         }
 
+        _outputDir = CreateFixtures();
         Start();
         try
         {
@@ -284,6 +363,6 @@ public class ExcelComValidation
 
             Console.WriteLine($"Excel content: all {errors.Count} assertion groups passed");
         }
-        finally { Stop(); }
+        finally { Stop(); DeleteFixtures(_outputDir); }
     }
 }

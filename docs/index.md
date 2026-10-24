@@ -481,6 +481,19 @@ using (var reader = new XlsxOrXlsbReadOrEdit())
 }
 ```
 
+`GetRowsOfSheet` (and `GetRowsOfXlsx` / `GetRowsOfXlsb`) returns a new `object[]` for every row, so rows can be stored or materialized safely.
+
+For large sheets where each row is consumed before the next one is read, use `GetRowsOfSheetReadOnly`. It reuses a single array for all rows; a row is valid only until the next iteration, so copy the values you need inside the loop.
+
+```csharp
+foreach (var row in reader.GetRowsOfSheetReadOnly("Sheet1"))
+{
+    // Consume row[] here; do not keep a reference to it.
+}
+```
+
+> **Breaking change:** earlier versions returned a shared buffer from `GetRowsOfSheet`. Code that relied on that buffer for speed should switch to `GetRowsOfSheetReadOnly`.
+
 ### Get sheet names
 
 ```csharp

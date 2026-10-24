@@ -25,7 +25,7 @@ public class StyleTests
         ["C2"] = new CellStyle { Fill = "FF0000", FontColor = "FFFFFF" },
     };
 
-    // GetRowsOfSheet yields the same array instance for every row, so clone it before storing.
+    // GetRowsOfSheetReadOnly reuses one array for every row, so clone each row before storing it.
     private static List<object[]> ReadRows(XlsxOrXlsbReadOrEdit reader, string sheetName)
         => reader.GetRowsOfSheet(sheetName).Select(row => (object[])row.Clone()).ToList();
 
