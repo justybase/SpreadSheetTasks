@@ -20,19 +20,30 @@ public class ExcelComConformanceTests
 {
     private static readonly string[] Formats = ["xlsx", "xlsb"];
 
-    public static IEnumerable<object[]> CaseAndFormat() => SpecCases.Ids.SelectMany(id => Formats.Select(f => new object[] { id, f }));
+    public static IEnumerable<object[]> CaseAndFormat()
+    {
+        if (!SpecCases.Available)
+            return Formats.Select(f => new object[] { "(spec missing)", f });
+        return SpecCases.Ids.SelectMany(id => Formats.Select(f => new object[] { id, f }));
+    }
 
     private readonly ComSession _session = ComSession.Instance;
 
     [Theory]
     [MemberData(nameof(CaseAndFormat))]
-    public void Writer_output_has_expected_structure(string caseId, string format) =>
+    public void Writer_output_has_expected_structure(string caseId, string format)
+    {
+        if (!SpecCases.Available) Assert.Skip("comparison/com/cases.json not found; run this suite from the comparison workspace");
         AssertWriterChecks(caseId, format, check => !check.StartsWith("cells:", StringComparison.Ordinal) && !check.StartsWith("numberFormat:", StringComparison.Ordinal));
+    }
 
     [Theory]
     [MemberData(nameof(CaseAndFormat))]
-    public void Writer_output_has_expected_cell_values(string caseId, string format) =>
+    public void Writer_output_has_expected_cell_values(string caseId, string format)
+    {
+        if (!SpecCases.Available) Assert.Skip("comparison/com/cases.json not found; run this suite from the comparison workspace");
         AssertWriterChecks(caseId, format, check => check.StartsWith("cells:", StringComparison.Ordinal) || check.StartsWith("numberFormat:", StringComparison.Ordinal));
+    }
 
     private void AssertWriterChecks(string caseId, string format, Func<string, bool> include)
     {
@@ -47,6 +58,7 @@ public class ExcelComConformanceTests
     [MemberData(nameof(CaseAndFormat))]
     public void Reader_reads_excel_authored_file(string caseId, string format)
     {
+        if (!SpecCases.Available) Assert.Skip("comparison/com/cases.json not found; run this suite from the comparison workspace");
         if (!_session.ExcelAvailable) { Console.WriteLine("SKIP — Excel not installed or COM unavailable"); return; }
         var path = _session.FixturePath(caseId, format);
         var sheets = SpecCases.Get(caseId).Sheets;
@@ -79,6 +91,7 @@ public class ExcelComConformanceTests
     [InlineData("xlsb")]
     public void Updater_replaces_sheet_and_excel_verifies(string format)
     {
+        if (!SpecCases.Available) Assert.Skip("comparison/com/cases.json not found; run this suite from the comparison workspace");
         if (!_session.ExcelAvailable) { Console.WriteLine("SKIP — Excel not installed or COM unavailable"); return; }
         var target = Path.Combine(_session.OutDir, $"updated-{Guid.NewGuid():N}.{format}");
         File.Copy(_session.FixturePath("update_template", format), target);
@@ -118,6 +131,9 @@ internal sealed class SpecCase
 internal static class SpecCases
 {
     private static readonly Lazy<Dictionary<string, SpecCase>> Cases = new(Load);
+    private static readonly string? SpecPath = FindSpecPath();
+
+    public static bool Available => SpecPath is not null;
 
     public static IReadOnlyList<string> Ids => Cases.Value.Keys.ToList();
 
@@ -159,8 +175,8 @@ internal static class SpecCases
 
     private static Dictionary<string, SpecCase> Load()
     {
-        var specPath = FindSpecPath();
-        using var doc = JsonDocument.Parse(File.ReadAllText(specPath));
+        if (SpecPath is null) return new(StringComparer.Ordinal);
+        using var doc = JsonDocument.Parse(File.ReadAllText(SpecPath));
         var result = new Dictionary<string, SpecCase>(StringComparer.Ordinal);
         foreach (var caseEl in doc.RootElement.GetProperty("cases").EnumerateArray())
         {
@@ -171,7 +187,7 @@ internal static class SpecCases
         return result;
     }
 
-    private static string FindSpecPath()
+    private static string? FindSpecPath()
     {
         var dir = new DirectoryInfo(AppContext.BaseDirectory);
         while (dir is not null)
@@ -180,7 +196,7 @@ internal static class SpecCases
             if (File.Exists(candidate)) return candidate;
             dir = dir.Parent;
         }
-        throw new FileNotFoundException("comparison/com/cases.json not found above " + AppContext.BaseDirectory);
+        return null;
     }
 
     private static SpecSheet ParseSheet(JsonElement sheet)
