@@ -44,7 +44,7 @@ namespace SpreadSheetTasks
         /// <param name="bufferSize">Size of the I/O write buffer.</param>
         /// <param name="InMemoryMode">If true, sheet content is written directly to the zip entry stream; if false, a temp file is used per sheet.</param>
         /// <param name="useScharedStrings">If true, string values are deduplicated via the sharedStrings part.</param>
-        /// <param name="_clvl">Compression level for the zip archive.</param>
+        /// <param name="_clvl">Compression level for the zip archive. The enum has no numeric levels; Optimal is the closest in output size to zlib level 3.</param>
         public XlsxWriter(string filePath, int bufferSize = 4096, bool InMemoryMode = true, bool useScharedStrings = true, CompressionLevel _clvl = CompressionLevel.Optimal)
         {
             ArgumentNullException.ThrowIfNull(filePath);
@@ -79,7 +79,7 @@ namespace SpreadSheetTasks
         /// <param name="bufferSize">Size of the I/O write buffer.</param>
         /// <param name="InMemoryMode">If true, sheet content is written directly to the zip entry stream.</param>
         /// <param name="useScharedStrings">If true, string values are deduplicated via the sharedStrings part.</param>
-        /// <param name="_clvl">Compression level for the zip archive.</param>
+        /// <param name="_clvl">Compression level for the zip archive. The enum has no numeric levels; Optimal is the closest in output size to zlib level 3.</param>
         /// <param name="leaveExcelArchiveOpen">If true, the underlying <see cref="ZipArchive"/> is left open when <see cref="Save"/> runs. Defaults to true for the stream ctor; the file-path ctor always sets it to false.</param>
         public XlsxWriter(Stream stream, int bufferSize = 4096, bool InMemoryMode = true, bool useScharedStrings = true, CompressionLevel _clvl = CompressionLevel.Optimal, bool leaveExcelArchiveOpen = true)
         {

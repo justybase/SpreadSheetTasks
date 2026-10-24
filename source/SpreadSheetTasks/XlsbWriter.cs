@@ -199,7 +199,7 @@ namespace SpreadSheetTasks
         private const int _rRkIntegerLowerLimit = -1 << 29;
         private const int _rRkIntegerUpperLimit = (1 << 29) - 1;
 
-        private readonly CompressionLevel _compressionLevel = CompressionLevel.Fastest;
+        private readonly CompressionLevel _compressionLevel = CompressionLevel.Optimal;
 
         /// <summary>cellXfs index for general/numeric style.</summary>
         internal const int XfStyleGeneral = 0;
@@ -227,8 +227,8 @@ namespace SpreadSheetTasks
         /// The file is overwritten if it already exists.
         /// </summary>
         /// <param name="path">Path of the .xlsb file to create.</param>
-        /// <param name="compressionLevel">Compression level for the zip archive.</param>
-        public XlsbWriter(string path, CompressionLevel compressionLevel = CompressionLevel.Fastest)
+        /// <param name="compressionLevel">Compression level for the zip archive. The enum has no numeric levels; Optimal is the closest in output size to zlib level 3.</param>
+        public XlsbWriter(string path, CompressionLevel compressionLevel = CompressionLevel.Optimal)
         {
             ArgumentNullException.ThrowIfNull(path);
             ArgumentException.ThrowIfNullOrWhiteSpace(path);
@@ -254,9 +254,9 @@ namespace SpreadSheetTasks
         /// Creates a new XLSB writer that writes to the supplied <see cref="Stream"/>.
         /// </summary>
         /// <param name="stream">Destination stream. The writer takes ownership of the stream position but does not close it unless <paramref name="leaveExcelArchiveOpen"/> is false.</param>
-        /// <param name="compressionLevel">Compression level for the zip archive.</param>
+        /// <param name="compressionLevel">Compression level for the zip archive. The enum has no numeric levels; Optimal is the closest in output size to zlib level 3.</param>
         /// <param name="leaveExcelArchiveOpen">If true, the underlying <see cref="ZipArchive"/> is left open when <see cref="Save"/> runs. Defaults to true for the stream ctor; the file-path ctor always sets it to false.</param>
-        public XlsbWriter(Stream stream, CompressionLevel compressionLevel = CompressionLevel.Fastest, bool leaveExcelArchiveOpen = true)
+        public XlsbWriter(Stream stream, CompressionLevel compressionLevel = CompressionLevel.Optimal, bool leaveExcelArchiveOpen = true)
         {
             ArgumentNullException.ThrowIfNull(stream);
             _excelStreamWasProvided = true;
@@ -527,7 +527,7 @@ namespace SpreadSheetTasks
                             break;
                         case TypeCode.Int64:
                             Int64 int64Value = _dataColReader.GetInt64(column);
-                            WriteDouble(Convert.ToDouble(int64Value), column, styleNum);
+                            WriteInt64Number(int64Value, column, styleNum);
                             break;
                         case TypeCode.Single:
                             float floatVal = _dataColReader.GetFloat(column);
@@ -582,8 +582,41 @@ namespace SpreadSheetTasks
                 case DateTime dtVal:
                     WriteDateTime(dtVal, column, cellStyle is not null ? RegisterStyle(cellStyle, NumFmtIdDateTime) : XfStyleDateTime);
                     return true;
-                case int or long or short or byte or sbyte or ushort or uint or ulong or float or double or decimal:
-                    WriteDouble(Convert.ToDouble(value), column, styleNum);
+                case int iVal:
+                    WriteInt64Number(iVal, column, styleNum);
+                    return true;
+                case long lVal:
+                    WriteInt64Number(lVal, column, styleNum);
+                    return true;
+                case short sVal:
+                    WriteRkNumberInteger(sVal, column, styleNum);
+                    return true;
+                case byte byVal:
+                    WriteRkNumberInteger(byVal, column, styleNum);
+                    return true;
+                case sbyte sbVal:
+                    WriteRkNumberInteger(sbVal, column, styleNum);
+                    return true;
+                case ushort usVal:
+                    WriteRkNumberInteger(usVal, column, styleNum);
+                    return true;
+                case uint uiVal:
+                    WriteInt64Number(uiVal, column, styleNum);
+                    return true;
+                case ulong ulVal when ulVal <= long.MaxValue:
+                    WriteInt64Number((long)ulVal, column, styleNum);
+                    return true;
+                case ulong ulVal:
+                    WriteDouble((double)ulVal, column, styleNum);
+                    return true;
+                case float fVal:
+                    WriteDouble(fVal, column, styleNum);
+                    return true;
+                case double dVal:
+                    WriteDouble(dVal, column, styleNum);
+                    return true;
+                case decimal mVal:
+                    WriteDouble(decimal.ToDouble(mVal), column, styleNum);
                     return true;
                 default:
                     return false;
@@ -780,6 +813,21 @@ namespace SpreadSheetTasks
 
             BitConverter.TryWriteBytes(buff[10..], val);
             _stream.Write(buff);
+        }
+
+        /// <summary>Writes an integer as a 4-byte RK value when it fits, otherwise as an 8-byte double.</summary>
+        private void WriteInt64Number(long val, int colNum, int styleNum = 0)
+        {
+            if (val >= int.MinValue && val <= int.MaxValue)
+            {
+                int intVal = (int)val;
+                if (intVal >= _rRkIntegerLowerLimit && intVal <= _rRkIntegerUpperLimit)
+                {
+                    WriteRkNumberInteger(intVal, colNum, styleNum);
+                    return;
+                }
+            }
+            WriteDouble((double)val, colNum, styleNum);
         }
 
         // 
