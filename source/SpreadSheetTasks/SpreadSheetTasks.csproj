@@ -1,6 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-	<TargetFrameworks>net10.0;net9.0;net8.0</TargetFrameworks>
+	<TargetFrameworks>net11.0;net10.0;net9.0;net8.0</TargetFrameworks>
 	<Nullable>enable</Nullable>
 	<IsAotCompatible>true</IsAotCompatible>
     <EnableAotAnalyzer>true</EnableAotAnalyzer>
@@ -17,7 +17,7 @@
     <FileVersion>2.1.0.0</FileVersion>
 	 <Version>2.1.0</Version>
 	<LangVersion>latest</LangVersion>
-    <PackageReleaseNotes>Default ZIP compression is now zlib level 3 for both XLSX and XLSB through a built-in ZIP writer, making writes 13-21% faster at a slightly larger file size; pass an explicit CompressionLevel to keep the previous enum-based behaviour. XLSB adds useSharedStrings: false for inline strings, row writes are buffered, shared strings are encoded in bulk, and ExcelReaderAbstract.CurrentRow exposes the current row as ReadOnlySpan&lt;FieldInfo&gt; without boxing. Readers now open files read-only with FileShare.Read, so read-only files and concurrent readers work.</PackageReleaseNotes>
+    <PackageReleaseNotes>Default ZIP compression is now zlib level 3 for both XLSX and XLSB through a built-in ZIP writer, making writes 13-21% faster at a slightly larger file size; pass an explicit CompressionLevel to keep the previous enum-based behaviour. XLSB adds useSharedStrings: false for inline strings, row writes are buffered, shared strings are encoded in bulk, and ExcelReaderAbstract.CurrentRow exposes the current row as ReadOnlySpan&lt;FieldInfo&gt; without boxing. XLSX reads now use byte scanners for worksheets and shared strings, preserving rich text, entities, xml:space and _xHHHH_ escapes while falling back to XmlReader for unsupported markup; worksheet UTF-8 is validated incrementally, and the 1904 date system is honored for both XLSX and XLSB. Readers now open files read-only with FileShare.Read, so read-only files and concurrent readers work.</PackageReleaseNotes>
     <PackageTags>xlsx;xlsb;excel;spreadsheets;nativeaot;aot;trimming</PackageTags>
     <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
     <RepositoryUrl>https://github.com/KrzysztofDusko/SpreadSheetTasks</RepositoryUrl>
@@ -27,5 +27,10 @@
   </PropertyGroup>
 	<ItemGroup>
 		<None Include="..\..\README.md" Pack="true" PackagePath="\" />
+	</ItemGroup>
+	<ItemGroup>
+		<AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleToAttribute">
+			<_Parameter1>Tests</_Parameter1>
+		</AssemblyAttribute>
 	</ItemGroup>
 </Project>

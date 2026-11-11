@@ -198,10 +198,9 @@ namespace SpreadSheetTasks
         private static readonly CultureInfo _invariantCulture = CultureInfo.InvariantCulture;
         private const int BUFFER_SIZE = 65_536;
         private const int BUFFER_SIZE_HALF = BUFFER_SIZE / 2;
-        private readonly char[] _buffer = new char[BUFFER_SIZE];
+        private char[] _buffer = new char[BUFFER_SIZE];
         private int _currentBufferOffset = 0;
         private int _currentStartingColumn;
-
         private void WriteByteToBuffer(byte val)
         {
             val.TryFormat(_buffer.AsSpan(_currentBufferOffset), out int len, default, _invariantCulture);
@@ -251,8 +250,31 @@ namespace SpreadSheetTasks
         //[MethodImpl(MethodImplOptions.AggressiveOptimization)]
         private void WriteStringToBuffer(ReadOnlySpan<char> val)
         {
+            EnsureBufferCapacity(_currentBufferOffset + val.Length);
             val.CopyTo(_buffer.AsSpan(_currentBufferOffset));
             _currentBufferOffset += val.Length;
+        }
+
+        /// <summary>
+        /// Guarantees room for <paramref name="required"/> characters plus headroom. The headroom
+        /// matters: numeric formatting uses <c>TryFormat</c> into the remaining span (which silently
+        /// writes nothing when the span is empty) and several callers append a single character
+        /// straight into <c>_buffer</c> after a <see cref="WriteStringToBuffer"/> call.
+        /// </summary>
+        private void EnsureBufferCapacity(int required)
+        {
+            const int headroom = 64;
+            if (required + headroom <= _buffer.Length)
+            {
+                return;
+            }
+
+            int newSize = _buffer.Length;
+            while (newSize < required + headroom)
+            {
+                newSize *= 2;
+            }
+            Array.Resize(ref _buffer, newSize);
         }
 
         /// <summary>True when <paramref name="val"/> has an ST_Xstring escape <c>_xHHHH_</c> starting at <paramref name="i"/>.</summary>
@@ -274,14 +296,15 @@ namespace SpreadSheetTasks
             int specialIdx = val.IndexOfAny(['&', '<', '>', '"', '\'', '\r', '_']);
             if (specialIdx < 0)
             {
+                EnsureBufferCapacity(_currentBufferOffset + val.Length + 8);
                 val.CopyTo(_buffer.AsSpan(_currentBufferOffset));
                 _currentBufferOffset += val.Length;
                 return;
             }
-            if (_currentBufferOffset + val.Length * 6 >= _buffer.Length)
-            {
-                return;
-            }
+
+            // Worst case is 7 characters per input character ("_x005F_"). A single long cell can
+            // be larger than the default row buffer, so grow it instead of dropping the value.
+            EnsureBufferCapacity(_currentBufferOffset + (val.Length * 7) + 64);
             val[..specialIdx].CopyTo(_buffer.AsSpan(_currentBufferOffset));
             _currentBufferOffset += specialIdx;
             for (int i = specialIdx; i < val.Length; i++)
@@ -315,8 +338,8 @@ namespace SpreadSheetTasks
                         break;
                     case '_' when IsXstringEscapeAt(val, i):
                         // Only the underscore changes: `_x0041_` becomes `_x005F_x0041_`.
-                        "_x005F".CopyTo(_buffer.AsSpan(_currentBufferOffset));
-                        _currentBufferOffset += 6;
+                        "_x005F_".CopyTo(_buffer.AsSpan(_currentBufferOffset));
+                        _currentBufferOffset += 7;
                         break;
                     default:
                         _buffer[_currentBufferOffset++] = c;

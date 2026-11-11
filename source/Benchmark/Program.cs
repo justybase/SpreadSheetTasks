@@ -37,10 +37,16 @@ class Program
     {
 #if RELEASE
         bool runFullBenchmarks = Array.Exists(args, a => string.Equals(a, "--full", StringComparison.OrdinalIgnoreCase));
-        if (runFullBenchmarks)
+        bool runSstBenchmarks = Array.Exists(args, a => string.Equals(a, "--sst", StringComparison.OrdinalIgnoreCase));
+        if (runSstBenchmarks)
+        {
+            BenchmarkRunner.Run<ReadBenchXlsxSst>();
+        }
+        else if (runFullBenchmarks)
         {
             BenchmarkRunner.Run<ReadBenchXlsb>();
             BenchmarkRunner.Run<ReadBenchXlsx>();
+            BenchmarkRunner.Run<ReadBenchXlsxSst>();
             BenchmarkRunner.Run<WriteBenchExcel>();
         }
         else
@@ -59,7 +65,7 @@ class Program
 #endif
     }
 }
-[SimpleJob(RuntimeMoniker.Net10_0)]
+[SimpleJob(RuntimeMoniker.Net11_0)]
 [MemoryDiagnoser]
 public class ReadBenchXlsx
 {
@@ -177,7 +183,7 @@ public class ReadBenchXlsx
     }
 }
 
-[SimpleJob(RuntimeMoniker.Net10_0)]
+[SimpleJob(RuntimeMoniker.Net11_0)]
 [MemoryDiagnoser]
 public class ReadBenchXlsb
 {
@@ -232,7 +238,122 @@ public class ReadBenchXlsb
     }
 }
 
-[SimpleJob(RuntimeMoniker.Net10_0)]
+[SimpleJob(RuntimeMoniker.Net11_0, warmupCount: 1, iterationCount: 3)]
+[MemoryDiagnoser]
+public class ReadBenchXlsxSst
+{
+    private readonly string _file200k = "200kFile.xlsx";
+    private readonly string _file65k = "65K_Records_Data.xlsx";
+    private string _entityFile = string.Empty;
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        _entityFile = Path.Combine(Path.GetTempPath(), "sst_entity_rows.xlsx");
+        var table = new DataTable();
+        table.Columns.Add("Text", typeof(string));
+        for (int row = 0; row < 20_000; row++)
+        {
+            table.Rows.Add($"row {row} & <tag> \"quote\" 'apos'");
+        }
+
+        using var writer = new XlsxWriter(_entityFile, useScharedStrings: false);
+        writer.AddSheet("Data");
+        writer.WriteSheet(table.CreateDataReader());
+    }
+
+    [GlobalCleanup]
+    public void Cleanup()
+    {
+        if (File.Exists(_entityFile))
+        {
+            File.Delete(_entityFile);
+        }
+    }
+
+    [Benchmark(Description = "Open 200K with shared strings")]
+    public int OpenWithSharedStrings()
+    {
+        using var reader = new XlsxOrXlsbReadOrEdit();
+        reader.Open(Path.Combine(Paths.FilesToTestDir, _file200k), readSharedStrings: true);
+        return reader.GetSheetNames().Length;
+    }
+
+    [Benchmark(Description = "Open 200K without shared strings")]
+    public int OpenWithoutSharedStrings()
+    {
+        using var reader = new XlsxOrXlsbReadOrEdit();
+        reader.Open(Path.Combine(Paths.FilesToTestDir, _file200k), readSharedStrings: false);
+        return reader.GetSheetNames().Length;
+    }
+
+    [Benchmark(Description = "Read 200K - GetValues")]
+    public long Read200kGetValues()
+    {
+        using var reader = new XlsxOrXlsbReadOrEdit();
+        reader.Open(Path.Combine(Paths.FilesToTestDir, _file200k));
+        reader.ActualSheetName = reader.GetSheetNames()[0];
+        object[]? row = null;
+        long rows = 0;
+        while (reader.Read())
+        {
+            row ??= new object[reader.FieldCount];
+            reader.GetValues(row);
+            rows++;
+        }
+        return rows;
+    }
+
+    [Benchmark(Description = "Read 65K - GetValues")]
+    public long Read65kGetValues()
+    {
+        using var reader = new XlsxOrXlsbReadOrEdit();
+        reader.Open(Path.Combine(Paths.FilesToTestDir, _file65k));
+        reader.ActualSheetName = reader.GetSheetNames()[0];
+        object[]? row = null;
+        long rows = 0;
+        while (reader.Read())
+        {
+            row ??= new object[reader.FieldCount];
+            reader.GetValues(row);
+            rows++;
+        }
+        return rows;
+    }
+
+    [Benchmark(Description = "Read 65K - CurrentRow")]
+    public long Read65kCurrentRow()
+    {
+        using var reader = new XlsxOrXlsbReadOrEdit();
+        reader.Open(Path.Combine(Paths.FilesToTestDir, _file65k));
+        reader.ActualSheetName = reader.GetSheetNames()[0];
+        long cells = 0;
+        while (reader.Read())
+        {
+            cells += reader.CurrentRow.Length;
+        }
+        return cells;
+    }
+
+    [Benchmark(Description = "Read 20K entity inline strings")]
+    public long ReadEntityRows()
+    {
+        using var reader = new XlsxOrXlsbReadOrEdit();
+        reader.Open(_entityFile);
+        reader.ActualSheetName = reader.GetSheetNames()[0];
+        object[]? row = null;
+        long rows = 0;
+        while (reader.Read())
+        {
+            row ??= new object[reader.FieldCount];
+            reader.GetValues(row);
+            rows++;
+        }
+        return rows;
+    }
+}
+
+[SimpleJob(RuntimeMoniker.Net11_0)]
 [MemoryDiagnoser]
 public class WriteBenchExcel
 {
@@ -375,7 +496,7 @@ public class WriteBenchExcel
     }
 }
 
-[SimpleJob(RuntimeMoniker.Net10_0, launchCount: 1, warmupCount: 1, iterationCount: 3)]
+[SimpleJob(RuntimeMoniker.Net11_0, launchCount: 1, warmupCount: 1, iterationCount: 3)]
 [MemoryDiagnoser]
 public class ReadBenchXlsxQuick
 {
@@ -399,7 +520,7 @@ public class ReadBenchXlsxQuick
     }
 }
 
-[SimpleJob(RuntimeMoniker.Net10_0, launchCount: 1, warmupCount: 1, iterationCount: 3)]
+[SimpleJob(RuntimeMoniker.Net11_0, launchCount: 1, warmupCount: 1, iterationCount: 3)]
 [MemoryDiagnoser]
 public class ReadBenchXlsbQuick
 {
@@ -437,7 +558,7 @@ public class ReadBenchXlsbQuick
     }
 }
 
-[SimpleJob(RuntimeMoniker.Net10_0, launchCount: 1, warmupCount: 1, iterationCount: 3)]
+[SimpleJob(RuntimeMoniker.Net11_0, launchCount: 1, warmupCount: 1, iterationCount: 3)]
 [MemoryDiagnoser]
 public class WriteBenchExcelQuick : WriteBenchExcel
 {

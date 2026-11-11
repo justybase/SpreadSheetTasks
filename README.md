@@ -21,7 +21,7 @@ without requiring Microsoft Excel.
 - Apply reusable cell styles (fills, font properties, number formats and XLSX alignment) by header or A1 range.
 - Update existing `.xlsx` and `.xlsb` sheets while preserving the rest of the workbook.
 - Update worksheet-backed pivot-cache ranges and mark dependent pivot tables for refresh.
-- Targets `net8.0`, `net9.0` and `net10.0`.
+- Targets `net8.0`, `net9.0`, `net10.0` and `net11.0`.
 - NativeAOT and trimming analyzers enabled for the library.
 
 ## Installation
@@ -105,6 +105,16 @@ On hot paths, `reader.CurrentRow` exposes the current row as a
 `ReadOnlySpan<FieldInfo>` without boxing numbers, dates or booleans. The span
 is valid until the next `Read()` call; see
 [GetExcelDataType / GetNativeValue](docs/index.md#getexceldatatype--getnativevalue).
+
+XLSX worksheets are parsed with a streaming byte scanner. XML entities and
+character references are decoded by the scanner; rows it cannot reproduce
+exactly (rich-text inline runs, unexpected elements, malformed references) are
+handed to `XmlReader` for that row only. A construct outside a row that the
+scanner cannot skip switches the rest of the part to `XmlReader`, and non-UTF-8
+parts use `XmlReader` entirely, so the fast path does not change the supported
+XML subset. Shared strings use a byte scanner too, with a streaming `XmlReader`
+fallback for unsupported markup.
+See [the performance guide](docs/performance-and-aot.md#fast-xlsx-worksheet-reader).
 
 ### Write typed rows
 
@@ -191,7 +201,7 @@ and `.xlsb` are supported by the updater API.
 
 The package enables the .NET AOT and trimming analyzers and is tested with a
 published NativeAOT application. The supported package target frameworks are
-`net8.0`, `net9.0` and `net10.0`.
+`net8.0`, `net9.0`, `net10.0` and `net11.0`.
 
 For an application, publish for a concrete runtime identifier:
 
@@ -212,10 +222,16 @@ The repository contains a runnable AOT smoke test covering XLSX, XLSB,
 
 ## Performance
 
-The repository includes BenchmarkDotNet projects for regular .NET 10 execution
-and a focused comparison between .NET 10 JIT and .NET 10 NativeAOT. Benchmark
+The repository includes BenchmarkDotNet projects for regular .NET 11 execution
+and a focused comparison between .NET 11 JIT and .NET 11 NativeAOT. Benchmark
 commands, environment details and measured results are maintained in
 [docs/performance-and-aot.md](docs/performance-and-aot.md).
+
+XLSX reads use a streaming byte scanner for worksheets and shared strings, with
+a per-row `XmlReader` fallback. The scanner is verified against the `XmlReader`
+path by a differential corpus that includes Excel-authored workbooks. The
+performance guide records measured shared-string, entity-heavy and
+`CurrentRow`-vs-`GetValues` results.
 
 Benchmark results depend on CPU, storage, operating system, input files and
 runtime version. Always reproduce measurements on the target environment before
@@ -241,6 +257,24 @@ compression-level constructor parameters nullable (`null` = level 3). Pass
 `XlsbWriter` also gained an optional `useSharedStrings` parameter, and
 `ExcelReaderAbstract.CurrentRow` was added. Because the constructor signatures
 changed, recompile against 2.1.0 rather than mixing binaries from 2.0.x.
+
+Recent correctness fixes (unreleased):
+
+- Inline strings containing an `_xHHHH_` sequence now round-trip: the XLSX writer
+  emits the complete `_x005F_` escape instead of dropping the separating
+  underscore.
+- A single cell larger than the 64 KiB row buffer is written instead of being
+  silently skipped; the buffer now grows for long values, and a row whose content
+  ends exactly on the buffer boundary no longer throws or loses the next cell.
+- `RowCount` returns `0` for a single-cell `dimension` such as `A1` instead of
+  throwing, and the XLSX reader no longer skips the row after an empty `<row/>`.
+  Empty `<v/>` and `<is/>` elements no longer throw in the `XmlReader` path.
+- The fast XLSX scanner no longer re-enters itself when it hands a part to
+  `XmlReader` before the first row (stray text or CDATA in `sheetData` used to
+  overflow the stack), and switching sheets disposes the previous part's streams.
+- Cell attributes `s` and `t` are looked up by name, so files that write them in
+  a different order than Excel are read correctly, and whitespace-only inline
+  strings follow the same `xml:space` rules as the `XmlReader` path.
 
 ## License
 

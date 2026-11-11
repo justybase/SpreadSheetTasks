@@ -528,4 +528,53 @@ public class WriterAdvancedTests
 
         File.Delete(fileName);
     }
+
+    /// <summary>
+    /// Rows whose content ends exactly on the 64 KiB row-buffer boundary used to leave the buffer
+    /// full: the next boolean cell threw IndexOutOfRangeException and the next number was dropped
+    /// silently. Both must now round-trip.
+    /// </summary>
+    [Fact]
+    public void LongRows_AtRowBufferBoundary_PreserveFollowingCells()
+    {
+        AssertLongRowsRoundTrip(trailingIsBoolean: true);
+        AssertLongRowsRoundTrip(trailingIsBoolean: false);
+    }
+
+    private static void AssertLongRowsRoundTrip(bool trailingIsBoolean)
+    {
+        // A fresh writer per length is required: the row buffer only has to be exactly full once,
+        // and it stays grown for the remaining rows of the same writer.
+        for (int length = 65_440; length <= 65_560; length++)
+        {
+            var table = new DataTable();
+            table.Columns.Add("Text", typeof(string));
+            table.Columns.Add("Trailing", trailingIsBoolean ? typeof(bool) : typeof(int));
+            table.Rows.Add(new string('x', length), trailingIsBoolean ? true : (object)length);
+
+            using var stream = new MemoryStream();
+            using (var writer = new XlsxWriter(stream, useScharedStrings: false))
+            {
+                writer.AddSheet("Sheet1");
+                writer.WriteSheet(table.CreateDataReader(), headers: false);
+            }
+            stream.Position = 0;
+
+            using var reader = new XlsxOrXlsbReadOrEdit();
+            reader.Open(stream);
+            reader.ActualSheetName = "Sheet1";
+
+            Assert.True(reader.Read(), $"length {length}: row missing");
+            Assert.Equal(length, ((string)reader.GetValue(0)).Length);
+            if (trailingIsBoolean)
+            {
+                Assert.Equal(true, reader.GetValue(1));
+            }
+            else
+            {
+                Assert.Equal(length, reader.GetInt32(1));
+            }
+            Assert.False(reader.Read(), $"length {length}: unexpected extra row");
+        }
+    }
 }

@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.Data;
 using System.Globalization;
@@ -13,8 +14,21 @@ using System.Xml;
 
 namespace SpreadSheetTasks;
 
-public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
+public sealed partial class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
 {
+    /// <summary>
+    /// Set to false by the parity tests to force the XmlReader path.
+    /// </summary>
+    internal bool _disableFastXlsxReader;
+
+    /// <summary>
+    /// Set to true by the parity tests to force the XmlReader shared-strings path.
+    /// </summary>
+    internal bool _disableFastSharedStringsReader;
+
+    /// <summary>True when the current workbook's shared strings were read by the byte scanner.</summary>
+    internal bool _fastSharedStringsUsed;
+
     private static readonly System.Text.RegularExpressions.Regex XstringRegex =
         new(@"_x([0-9A-Fa-f]{4})_", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
 
@@ -108,6 +122,7 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
         return hasDateToken;
     }
 
+    private bool _uses1904DateSystem;
     private string _sharedStringsLocation = null;
     private string _stylesLocation = null;
     //private string _themeLocation = null;
@@ -159,6 +174,8 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
 
     private void OpenXlsxArchive(bool readSharedStrings)
     {
+        _uses1904DateSystem = false;
+        _fastSharedStringsUsed = false;
         var e1 = _xlsxArchive.GetEntry("xl/workbook.xml");
         using (var str = e1.Open())
         {
@@ -170,7 +187,14 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
                     continue;
                 }
 
-                if (reader.Name == "sheet")
+                if (reader.LocalName == "workbookPr")
+                {
+                    string? date1904 = reader.GetAttribute("date1904");
+                    _uses1904DateSystem = string.Equals(date1904, "1", StringComparison.Ordinal)
+                        || string.Equals(date1904, "true", StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(date1904, "on", StringComparison.OrdinalIgnoreCase);
+                }
+                else if (reader.Name == "sheet")
                 {
                     string name = reader.GetAttribute("name");
                     string rId = reader.GetAttribute("r:id");
@@ -216,6 +240,8 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
 
     private void OpenXlsbArchive(bool readSharedStrings)
     {
+        _uses1904DateSystem = false;
+        _fastSharedStringsUsed = false;
         var e1 = _xlsxArchive.GetEntry("xl/workbook.bin");
 
         BiffReaderWriter reader;
@@ -247,7 +273,7 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
         {
             str?.Dispose();
         }
-
+        _uses1904DateSystem = reader._uses1904DateSystem;
 
         _resultCount = _worksheetIdToName.Count;
 
@@ -417,7 +443,37 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
             throw new Exception("no shared strings found");
         }
 
+        _fastSharedStringsUsed = false;
         var sharedstringsEntry = _xlsxArchive.GetEntry($@"xl/{_sharedStringsLocation}");
+
+        // The byte scanner handles plain and rich-text items without building an XML reader
+        // for each string. Anything it cannot reproduce exactly falls back to XmlReader below.
+        long sharedStringsByteLength = sharedstringsEntry.Length;
+        if (!_disableFastSharedStringsReader
+            && sharedStringsByteLength > 0
+            && sharedStringsByteLength <= MaxSharedStringsBytes)
+        {
+            int sharedStringsLength = (int)sharedStringsByteLength;
+            byte[]? data = TryReadEntryBytes(sharedstringsEntry, sharedStringsLength);
+            if (data is not null)
+            {
+                try
+                {
+                    if (TryReadSharedStringsFast(data.AsSpan(0, sharedStringsLength), out string[]? fastStrings))
+                    {
+                        _sharedStringArray = fastStrings!;
+                        _uniqueStringCount = fastStrings!.Length;
+                        _fastSharedStringsUsed = true;
+                        return;
+                    }
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(data);
+                }
+            }
+        }
+
         Stream str = sharedstringsEntry.Open();
         //Stream str = getMemoryStream(sharedstringsEntry.Open(), sharedstringsEntry.Length);
 
@@ -449,48 +505,115 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
                 throw new Exception("not openXml 2006 format!");
             }
 
-            if (_uniqueStringCount !=-1)
-            {
-                _sharedStringArray = new string[_uniqueStringCount];
-            }
-            else
-            {
-                _sharedStringArray = new string[1024];
-            }
+            // The declared count is only a capacity hint: damaged files lie about it, and a
+            // zero or negative value must not make the first item fail with an empty array.
+            int capacity = _uniqueStringCount > 0
+                ? Math.Min(_uniqueStringCount, MaxSharedStringsInitialCapacity)
+                : 1024;
+            var strings = new List<string>(capacity);
 
-            int stringNum = 0;
             while (reader.Read())
             {
                 if (reader.IsStartElement("si"))
                 {
-                    reader.Read();
-                    if (reader.IsStartElement("t"))
-                    {
-                        string vall = DecodeXstring(reader.ReadElementContentAsString());
-                        // si -> t->  t -> value
-                        //string vall = reader.Value;
-
-                        if (stringNum >= _sharedStringArray.Length)
-                        {
-                            Array.Resize(ref _sharedStringArray, 2 * _sharedStringArray.Length);
-                        }
-
-                        _sharedStringArray[stringNum++] = vall;
-                    }
+                    strings.Add(DecodeXstring(ReadSharedStringItem(reader)));
                 }
             }
 
-            if (stringNum != _sharedStringArray.Length)
-            {
-                Array.Resize(ref _sharedStringArray, stringNum);
-            }
-
+            _sharedStringArray = strings.ToArray();
+            _uniqueStringCount = _sharedStringArray.Length;
         }
         finally
         {
             str.Dispose();
         }
+    }
 
+    /// <summary>
+    /// Reads one &lt;si&gt; item. Rich runs are concatenated (their text is the cell's text),
+    /// while phonetic guides (&lt;rPh&gt;) are metadata and stay out. The reader is left on the
+    /// matching &lt;/si&gt; end element.
+    /// </summary>
+    private static string ReadSharedStringItem(XmlReader reader)
+    {
+        if (reader.IsEmptyElement)
+        {
+            return string.Empty;
+        }
+
+        int itemDepth = reader.Depth;
+        StringBuilder? builder = null;
+        bool advance = true;
+        while (true)
+        {
+            if (advance && !reader.Read())
+            {
+                break;
+            }
+            advance = true;
+
+            if (reader.NodeType == XmlNodeType.EndElement && reader.Depth == itemDepth)
+            {
+                break;
+            }
+            if (reader.NodeType != XmlNodeType.Element)
+            {
+                continue;
+            }
+
+            if (reader.LocalName == "t")
+            {
+                // ReadElementContentAsString applies entity/line-end decoding and xml:space.
+                (builder ??= new StringBuilder()).Append(reader.ReadElementContentAsString());
+                advance = false;
+            }
+            else if (reader.LocalName == "rPh")
+            {
+                reader.Skip();
+                advance = false;
+            }
+        }
+
+        return builder?.ToString() ?? string.Empty;
+    }
+
+    private static byte[]? TryReadEntryBytes(ZipArchiveEntry entry, int length)
+    {
+        // Rent instead of allocating: a shared-strings part is often several megabytes, and
+        // keeping the temporary decompression buffer off the large-object heap avoids an
+        // extra LOH allocation and its gen2 pressure on every open of a text-heavy workbook.
+        byte[] buffer = ArrayPool<byte>.Shared.Rent(length);
+        try
+        {
+            using Stream stream = entry.Open();
+            int read = 0;
+            while (read < length)
+            {
+                int chunk = Math.Min(65536, length - read);
+                int count = stream.Read(buffer, read, chunk);
+                if (count <= 0)
+                {
+                    ArrayPool<byte>.Shared.Return(buffer);
+                    return null;
+                }
+                read += count;
+            }
+
+            // The central directory length is a claim; do not accept a truncated/expanded part
+            // as a successful fast read, because the fallback would then silently lose data.
+            if (stream.ReadByte() >= 0)
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+                return null;
+            }
+        }
+        catch
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+            throw;
+        }
+
+        return buffer;
     }
 
     public void FillBinSharedStrings()
@@ -628,6 +751,7 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
             }
         }
         _stylesCellXfsArray = _stylesCellXfs.ToArray();
+        BuildFastDateStyles();
     }
 
     private void FillBinStyles()
@@ -683,6 +807,7 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
             }
         }
         _stylesCellXfsArray = _stylesCellXfs.ToArray();
+        BuildFastDateStyles();
     }
 
     public override string[] GetSheetNames()
@@ -698,6 +823,14 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
     private XmlReader? _xmlReader;
     private BiffReaderWriter _biffReader;
     private ZipArchiveEntry _sheetEntry;
+
+    /// <summary>
+    /// True once <see cref="InitSheetXlsxReader"/> has prepared the current part. This is deliberately
+    /// separate from <see cref="_isFirstRow"/>: the fast scanner can hand the remainder of a sheet to
+    /// XmlReader before any row was read, and re-initialising there would restart the scan and recurse
+    /// until the stack overflows.
+    /// </summary>
+    private bool _xlsxSheetReaderInitialized;
 
     private int _prevRowNum = -1;
     private bool _isFirstRow = true;
@@ -732,12 +865,46 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
         _returnValue = true;
         innerRow = new FieldInfo[4096];
         _sheetEntry = GetArchiverEntry(ActualSheetName);
+
+        // Fast-scanner state belongs to the previous entry's deflate stream; the old reader
+        // state is abandoned here (its stream is disposed by the caller paths).
+        _xlsxSheetReaderInitialized = false;
+        _fastActive = false;
+        _fastRowHeaderPending = false;
+        _fastPos = 0;
+        _fastLen = 0;
+        _fastEof = false;
+        _fastValidated = 0;
+        _fastInvalidUtf8 = false;
+        _fastValidateUtf8 = false;
+        _fastXlsxReaderUsed = false;
+        _fastRowsParsed = 0;
+        _fastRowsFallback = 0;
+        _fastConsecutiveFallbacks = 0;
+        _fastSheetDataPreservesWhitespace = false;
+        _fastRowPreservesWhitespace = false;
     }
     private void InitSheetXlsxReader()
     {
         SheetPreInitialize();
-        //sheetStream = sheetEntry.Open();
-        _sheetStream = new BufferedStream(_sheetEntry.Open(), 65_536);
+        // Mark the part as prepared before touching the stream: if anything below throws or the
+        // stream turns out to be empty, ReadXlsx must not call back into this method.
+        _xlsxSheetReaderInitialized = true;
+        // XmlTextReaderImpl has its own buffer and reads ahead; wrapping the deflate stream in
+        // BufferedStream only adds an extra copy of every byte (measurably slower on large sheets).
+        _sheetStream = _sheetEntry.Open();
+
+        if (!_disableFastXlsxReader)
+        {
+            if (TryInitFastSheetReader())
+            {
+                return;
+            }
+
+            // The probe consumed some bytes; re-open the entry so XmlReader sees the whole part.
+            _sheetStream.Dispose();
+            _sheetStream = _sheetEntry.Open();
+        }
 
         var xmlSettings = new XmlReaderSettings
         {
@@ -776,9 +943,13 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
 
     private bool ReadXlsx()
     {
-        if (_isFirstRow)
+        if (!_xlsxSheetReaderInitialized)
         {
             InitSheetXlsxReader();
+        }
+        if (_fastActive)
+        {
+            return ReadXlsxFast();
         }
         if (_emptyRowCnt < _howManyEmptyRow)
         {
@@ -787,21 +958,16 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
             return true;
         }
 
-        //https://github.com/KrzysztofDusko/SpreadSheetTasks/issues/4
-        if (innerRow.Length > _numberOfLastColumnWithData - _numberOfFirstColumnWithData)
-        {
-            for (int i = _numberOfFirstColumnWithData; i < _numberOfLastColumnWithData; i++)
-            {
-                innerRow[i - _numberOfFirstColumnWithData].type = ExcelDataType.Null;
-            }
-        }
-
         if (_emptyRowCnt == -1)
         {
-            if (!_xmlReader!.ReadToFollowing("row"))
+            // An empty row (<row/>) leaves the reader on the next row's start element;
+            // ReadToFollowing would advance past it, losing that row.
+            bool alreadyOnRow = _xmlReader!.NodeType == XmlNodeType.Element && _xmlReader.Name == "row";
+            if (!alreadyOnRow && !_xmlReader.ReadToFollowing("row"))
             {
                 _xmlReader.Dispose();
                 _sheetStream.Dispose();
+                _xlsxSheetReaderInitialized = false;
                 _isFirstRow = true; // RESET
                 return false;
             }
@@ -844,15 +1010,37 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
 
         _prevColNum = -1;
         _rowWidth = 0;
+        ReadCellsFromXml(_xmlReader);
+
+        if (_isFirstRow)
+        {
+            _isFirstRow = false;
+            _columnsCntFromFirstRow = _numberOfLastColumnWithData - _numberOfFirstColumnWithData + 1;
+            Array.Resize<FieldInfo>(ref innerRow, _columnsCntFromFirstRow);
+            FieldCount = _columnsCntFromFirstRow;
+        }
+        if (_rowWidth > FieldCount)
+        {
+            FieldCount = _rowWidth;
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Parses the cells of the row the reader is positioned on into <see cref="innerRow"/>.
+    /// Shared by the regular XmlReader path and the per-row fallback of the fast scanner.
+    /// </summary>
+    private void ReadCellsFromXml(XmlReader xmlReader)
+    {
         int cellIndex = 0; // Track cell position sequentially
-        while (_xmlReader.Read() && _xmlReader.IsStartElement("c"))
+        while (xmlReader.Read() && xmlReader.IsStartElement("c"))
         {
             // Try to get "r" attribute for column position
-            bool hasRAttribute = _xmlReader.MoveToAttribute("r");
-            
+            bool hasRAttribute = xmlReader.MoveToAttribute("r");
+
             if (hasRAttribute)
             {
-                _len = _xmlReader.ReadValueChunk(_buffer, 0, _buffer.Length);
+                _len = ReadValueChunkSafe(xmlReader);
                 _colNum = -1;
 
                 // Fast path for most common references like "A12", "B3", etc.
@@ -890,10 +1078,7 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
             }
             cellIndex++;
 
-            if (_isFirstRow && _numberOfFirstColumnWithData == -1)
-            {
-                _numberOfFirstColumnWithData = _colNum;
-            }
+            EnsureColumnBase(_colNum);
             if (_isFirstRow && _numberOfLastColumnWithData < _colNum)
             {
                 _numberOfLastColumnWithData = _colNum;
@@ -903,59 +1088,63 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
             _rowWidth = Math.Max(_rowWidth, _tmpLen + 1);
             ref FieldInfo valueX = ref innerRow[_tmpLen];
 
-            bool isEmptyElement = _xmlReader.IsEmptyElement;
+            bool isEmptyElement = xmlReader.IsEmptyElement;
             if (!isEmptyElement)
             {
                 char sstMark = '\0';
                 int sstLen = 0;
                 int styleId = -1;
 
-                _success = _xmlReader.MoveToNextAttribute();
-
-                if (_success && _xmlReader.Name == "s")
+                // "s" and "t" are looked up by name rather than by walking forward from "r":
+                // Excel writes r, s, t in that order, but other writers do not, and a cell with
+                // the type before the reference would silently be read as a number.
+                if (xmlReader.MoveToAttribute("s"))
                 {
-                    _len = _xmlReader.ReadValueChunk(_buffer, 0, _buffer.Length);
+                    _len = ReadValueChunkSafe(xmlReader);
                     styleId = ParseToUnsignedIntFromBuffer(_buffer, _len);
-                    _success = _xmlReader.MoveToNextAttribute();
                 }
 
-                if (_success && _xmlReader.Name == "t")
+                if (xmlReader.MoveToAttribute("t"))
                 {
-                    sstLen = _xmlReader.ReadValueChunk(_buffer, 0, _buffer.Length);
-                    sstMark = _buffer[0];
+                    sstLen = ReadValueChunkSafe(xmlReader);
+                    sstMark = sstLen > 0 ? _buffer[0] : '\0';
                 }
 
-                _xmlReader.MoveToElement();
+                xmlReader.MoveToElement();
                 //bool success = false;
                 if (sstMark == 'i' && sstLen == 9)
                 {
-                    //success =
-                    _xmlReader.ReadToDescendant("is");
-                    _xmlReader.Read();
-                    _xmlReader.Read();
-                    valueX.type = ExcelDataType.String;
-                    valueX.strValue = DecodeXstring(_xmlReader.ReadContentAsString());
+                    if (xmlReader.ReadToDescendant("is"))
+                    {
+                        valueX.type = ExcelDataType.String;
+                        valueX.strValue = DecodeXstring(ReadInlineStringText(xmlReader));
+                    }
+                    else
+                    {
+                        valueX.type = ExcelDataType.Null;
+                    }
                 }
-                else if (_xmlReader.ReadToDescendant("v"))
+                else if (xmlReader.ReadToDescendant("v"))
                 {
-                    _xmlReader.Read();
+                    xmlReader.Read();
 
                     if (sstMark == 's' && sstLen == 1) // 's' = string/sharedstring'b' = boolean, 'e' = error
                     {
-                        _len = _xmlReader.ReadValueChunk(_buffer, 0, _buffer.Length);
+                        _len = ReadValueChunkSafe(xmlReader);
                         valueX.type = ExcelDataType.String;
                         valueX.strValue = _sharedStringArray[ParseToUnsignedIntFromBuffer(_buffer, _len)];
                     }
                     else if (sstMark == 's' || sstMark == 'i' && sstLen == 9)  // InlineStr?
                     {
-                        if (_xmlReader.NodeType != XmlNodeType.EndElement || _xmlReader.Name != "c")
+                        if (xmlReader.NodeType != XmlNodeType.EndElement || xmlReader.Name != "c")
                         {
                             //if (xmlReader.NodeType != XmlNodeType.Text)
                             //{ 
                             //    xmlReader.Read();
                             //}
                             valueX.type = ExcelDataType.String;
-                            valueX.strValue = _xmlReader.ReadContentAsString();
+                            // t="str" (formula result) is also ST_Xstring, like shared and inline strings.
+                            valueX.strValue = DecodeXstring(ReadContentAsStringSafe(xmlReader));
                         }
                         else
                         {
@@ -966,16 +1155,16 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
                     else if (TreatAllColumnsAsText)
                     {
                         valueX.type = ExcelDataType.String;
-                        valueX.strValue = _xmlReader.ReadContentAsString();
+                        valueX.strValue = ReadContentAsStringSafe(xmlReader);
                     }
                     else
                     {
-                        _len = _xmlReader.ReadValueChunk(_buffer, 0, _buffer.Length);
+                        _len = ReadValueChunkSafe(xmlReader);
                         if (sstMark == 'b') // 'b' = boolean, 'e' = error
                         {
                             valueX.type = ExcelDataType.Boolean;
                             //valueX.int32Value = (_buffer[0] - '0');
-                            valueX.boolValue = _buffer[0] == '1';
+                            valueX.boolValue = _len > 0 && _buffer[0] == '1';
                         }
                         else if (sstMark == 'e') // 'b' = boolean, 'e' = error
                         {
@@ -984,16 +1173,13 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
                         }
                         else if (styleId != -1)
                         {
-                            var s = _stylesCellXfsArray[styleId];
-                            int numFormatId = s.NumFmtId;
-
-                            if (_numberFormatsTypeDictionary.TryGetValue(numFormatId, out Type type) && type == typeof(DateTime?)
+                            if (_fastDateStyles is not null && _fastDateStyles[styleId]
                                 && double.TryParse(_buffer.AsSpan(0, _len), NumberStyles.Float, provider: invariantCultureInfo, out double doubleDate)
                                 //&& FastDoubleParser.TryParseDouble(_buffer.AsSpan(0, len), out double doubleDate)
                                 )
                             {
                                 valueX.type = ExcelDataType.DateTime;
-                                valueX.dtValue = DateTime.FromOADate(doubleDate);
+                                valueX.dtValue = ConvertFromOADate(doubleDate);
                             }
                             else
                             {
@@ -1036,31 +1222,121 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
 
             if (!isEmptyElement) // depth = ...
             {
-                while (_xmlReader.Depth > 3)
+                while (xmlReader.Depth > 3)
                 {
                     //reader.Skip();
-                    _xmlReader.Read();
+                    xmlReader.Read();
                 }
             }
         }
+    }
 
-        if (_isFirstRow)
+    /// <summary>
+    /// Reads an attribute or text value into <see cref="_buffer"/>. Empty &lt;v/&gt; elements leave
+    /// the reader on an element/end-element node, where <see cref="XmlReader.ReadValueChunk"/> throws.
+    /// </summary>
+    private int ReadValueChunkSafe(XmlReader xmlReader)
+    {
+        return xmlReader.NodeType switch
         {
-            _isFirstRow = false;
-            _columnsCntFromFirstRow = _numberOfLastColumnWithData - _numberOfFirstColumnWithData + 1;
-            Array.Resize<FieldInfo>(ref innerRow, _columnsCntFromFirstRow);
-            FieldCount = _columnsCntFromFirstRow;
-        }
-        if (_rowWidth > FieldCount)
+            XmlNodeType.Attribute or XmlNodeType.Text or XmlNodeType.CDATA
+                or XmlNodeType.Whitespace or XmlNodeType.SignificantWhitespace
+                => xmlReader.ReadValueChunk(_buffer, 0, _buffer.Length),
+            _ => 0,
+        };
+    }
+
+    private static string ReadContentAsStringSafe(XmlReader xmlReader)
+    {
+        return xmlReader.NodeType switch
         {
-            FieldCount = _rowWidth;
+            XmlNodeType.Attribute or XmlNodeType.Text or XmlNodeType.CDATA
+                or XmlNodeType.Whitespace or XmlNodeType.SignificantWhitespace
+                => xmlReader.ReadContentAsString(),
+            _ => string.Empty,
+        };
+    }
+
+    /// <summary>
+    /// Concatenates the text of an &lt;is&gt; element (plain &lt;t&gt; or rich-text &lt;r&gt;&lt;t&gt; runs)
+    /// and leaves the reader on the matching end element. Empty elements yield an empty string.
+    /// </summary>
+    private static string ReadInlineStringText(XmlReader xmlReader)
+    {
+        if (xmlReader.IsEmptyElement)
+        {
+            return string.Empty;
         }
-        return true;
+
+        int elementDepth = xmlReader.Depth;
+        var builder = new System.Text.StringBuilder();
+        while (xmlReader.Read())
+        {
+            if (xmlReader.NodeType == XmlNodeType.EndElement && xmlReader.Depth == elementDepth)
+            {
+                break;
+            }
+            if (xmlReader.NodeType is XmlNodeType.Text or XmlNodeType.CDATA
+                or XmlNodeType.Whitespace or XmlNodeType.SignificantWhitespace)
+            {
+                builder.Append(xmlReader.Value);
+            }
+        }
+        return builder.ToString();
+    }
+
+    private DateTime ConvertFromOADate(double serial)
+        => DateTime.FromOADate(_uses1904DateSystem ? serial + 1462d : serial);
+
+    /// <summary>
+    /// Keeps the row buffer's zero index on the first column that has appeared in the sheet so
+    /// far. A later row can start left of that (a blank A1 followed by data in A2 is valid
+    /// SpreadsheetML), so the cells already parsed for the current row are shifted right before
+    /// the new column is written.
+    /// </summary>
+    private void EnsureColumnBase(int column)
+    {
+        if (column < 0)
+        {
+            return;
+        }
+        if (_numberOfFirstColumnWithData < 0)
+        {
+            _numberOfFirstColumnWithData = column;
+            return;
+        }
+        if (column >= _numberOfFirstColumnWithData)
+        {
+            return;
+        }
+
+        int delta = _numberOfFirstColumnWithData - column;
+        int used = Math.Min(_rowWidth, innerRow.Length);
+        int needed = used + delta;
+        if (needed > innerRow.Length)
+        {
+            Array.Resize(ref innerRow, needed);
+        }
+        if (used > 0)
+        {
+            Array.Copy(innerRow, 0, innerRow, delta, used);
+        }
+        for (int i = 0; i < delta; i++)
+        {
+            innerRow[i].type = ExcelDataType.Null;
+        }
+
+        _rowWidth = needed;
+        _numberOfFirstColumnWithData = column;
     }
 
     private int ResizeRowIfNeeded()
     {
         int _tmpLen = _colNum - _numberOfFirstColumnWithData;
+        if (_tmpLen < 0)
+        {
+            throw new InvalidDataException($"cell reference column {_colNum} is left of the row base");
+        }
         if (_tmpLen >= innerRow.Length)
         {
             Array.Resize(ref innerRow, _tmpLen + 1);
@@ -1146,13 +1422,11 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
         {
             if (_biffReader._readCell)
             {
+                EnsureColumnBase(_colNum);
+
                 //determine first row length
                 if (_isFirstRow)
                 {
-                    if (_numberOfFirstColumnWithData == -1)
-                    {
-                        _numberOfFirstColumnWithData = _colNum;
-                    }
                     _numberOfLastColumnWithData = _colNum;
                     _columnsCntFromFirstRow = _numberOfLastColumnWithData - _numberOfFirstColumnWithData + 1;
                     FieldCount = _columnsCntFromFirstRow;
@@ -1190,36 +1464,23 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
                         {
                             double doubleVal = _biffReader._doubleVal;
                             var styleIndex = _biffReader._xfIndex;
-                            if (styleIndex == 0) // general
+                            if (styleIndex != 0 && _fastDateStyles is not null && _fastDateStyles[styleIndex])
+                            {
+                                valueX.type = ExcelDataType.DateTime;
+                                valueX.dtValue = ConvertFromOADate(doubleVal);
+                                if (TreatAllColumnsAsText)
+                                {
+                                    valueX.type = ExcelDataType.String;
+                                    valueX.strValue = valueX.dtValue.ToString();
+                                }
+                            }
+                            else
                             {
                                 SetValueForXlsb(doubleVal, ref valueX);
                                 if (TreatAllColumnsAsText)
                                 {
                                     valueX.type = ExcelDataType.String;
                                     valueX.strValue = valueX.doubleValue.ToString();
-                                }
-                            }
-                            else
-                            {
-                                int numFormatId = _stylesCellXfsArray[styleIndex].NumFmtId;
-                                if (_numberFormatsTypeDictionary.TryGetValue(numFormatId, out Type type) && type == typeof(DateTime?))
-                                {
-                                    valueX.type = ExcelDataType.DateTime;
-                                    valueX.dtValue = DateTime.FromOADate((double)doubleVal);
-                                    if (TreatAllColumnsAsText)
-                                    {
-                                        valueX.type = ExcelDataType.String;
-                                        valueX.strValue = valueX.dtValue.ToString();
-                                    }
-                                }
-                                else
-                                {
-                                    XlsxOrXlsbReadOrEdit.SetValueForXlsb(doubleVal, ref valueX);
-                                    if (TreatAllColumnsAsText)
-                                    {
-                                        valueX.type = ExcelDataType.String;
-                                        valueX.strValue = valueX.doubleValue.ToString();
-                                    }
                                 }
                             }
                             break;
@@ -1249,7 +1510,11 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
                         // A B !NULL! !NULL! C
                         for (int i = _prevColNum + 1; i < _colNum; i++)
                         {
-                            innerRow[i - _numberOfFirstColumnWithData].type = ExcelDataType.Null;
+                            int index = i - _numberOfFirstColumnWithData;
+                            if ((uint)index < (uint)innerRow.Length)
+                            {
+                                innerRow[index].type = ExcelDataType.Null;
+                            }
                         }
                     }
                     // A B C !NULL! !NULL!
@@ -1257,7 +1522,11 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
                     {
                         for (int i = 1; i <= _numberOfLastColumnWithData - _prevColNum; i++)
                         {
-                            innerRow[_prevColNum + i - _numberOfFirstColumnWithData].type = ExcelDataType.Null;
+                            int index = _prevColNum + i - _numberOfFirstColumnWithData;
+                            if ((uint)index < (uint)innerRow.Length)
+                            {
+                                innerRow[index].type = ExcelDataType.Null;
+                            }
                         }
                     }
                 }
@@ -1605,6 +1874,11 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
             // Reset reader state when switching sheets
             if (_actualSheetName != value)
             {
+                // The previous part's streams are no longer reachable from a Read() call once the
+                // state below is reset; dispose them here instead of leaking them until GC.
+                _xmlReader?.Dispose();
+                _sheetStream?.Dispose();
+                _xlsxSheetReaderInitialized = false;
                 _isFirstRow = true;
                 _prevRowNum = -1;
                 _columnsCntFromFirstRow = -1;
@@ -1644,12 +1918,28 @@ public sealed class XlsxOrXlsbReadOrEdit : ExcelReaderAbstract, IDisposable
         }
 
         int i1 = _actualSheetDimensions.IndexOf(':');
+        if (i1 < 0)
+        {
+            // A single-cell dimension (for example "A1") has no end reference and no data rows.
+            _rowCount = 0;
+            return _rowCount;
+        }
         string t1 = _actualSheetDimensions[..i1];
         int i2 = t1.IndexOfAny(_digits);
+        if (i2 < 0)
+        {
+            _rowCount = 0;
+            return _rowCount;
+        }
         _ = int.TryParse(t1[i2..], out int start);
 
         t1 = _actualSheetDimensions[(i1 + 1)..];
         i2 = t1.IndexOfAny(_digits);
+        if (i2 < 0)
+        {
+            _rowCount = 0;
+            return _rowCount;
+        }
 
         _ = int.TryParse(t1[i2..], out int end);
         _rowCount = end - start; // header is not row !!

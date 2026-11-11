@@ -4,6 +4,7 @@ using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Data;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text;
 
 namespace SpreadSheetTasks
@@ -68,6 +69,7 @@ namespace SpreadSheetTasks
         internal uint _workbookId;
         internal string _recId;
         internal string _workbookName;
+        internal bool _uses1904DateSystem;
         internal bool _isSheet;
 
         internal bool ReadWorkbook()
@@ -109,6 +111,12 @@ namespace SpreadSheetTasks
         private void ParseWorkbookRecord(uint recordId, ReadOnlySpan<byte> data)
         {
             _isSheet = false;
+            if (recordId == 0x0099 && data.Length >= sizeof(uint))
+            {
+                // BrtWbProp: bit 0 is f1904.
+                _uses1904DateSystem = (GetDWord(data, 0) & 1) != 0;
+                return;
+            }
             if (recordId == _sheet)
             {
                 _workbookId = GetDWord(data, 4);
@@ -420,7 +428,16 @@ namespace SpreadSheetTasks
 
         private static string GetString(ReadOnlySpan<byte> buffer, int offset, uint length)
         {
-            return Encoding.Unicode.GetString(buffer.Slice(offset, (int)length * 2));
+            return DecodeUtf16(buffer.Slice(offset, (int)length * 2));
+        }
+
+        private static string DecodeUtf16(ReadOnlySpan<byte> bytes)
+        {
+            // XLSB stores UTF-16LE; avoiding the general encoding path roughly halves
+            // the cost for the many short shared and inline strings.
+            return BitConverter.IsLittleEndian
+                ? new string(MemoryMarshal.Cast<byte, char>(bytes))
+                : Encoding.Unicode.GetString(bytes);
         }
 
         //https://github.com/ExcelDataReader/ExcelDataReader
@@ -431,7 +448,7 @@ namespace SpreadSheetTasks
             if (length == uint.MaxValue)
                 return null;
 
-            string result = Encoding.Unicode.GetString(buffer.Slice(offset, (int)length * 2));
+            string result = DecodeUtf16(buffer.Slice(offset, (int)length * 2));
             offset += (int)length * 2;
             return result;
         }

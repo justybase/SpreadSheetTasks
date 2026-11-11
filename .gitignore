@@ -386,7 +386,10 @@ FodyWeavers.xsd
 # JetBrains Rider
 .idea/
 *.sln.iml
+# Local agent-tool settings (not part of the build)
+.commandcode/
 *.xlsb
 *.xlsx
 /test_output/updater_pivot_*.json
+/test_output/fast-reader-fixtures/
 /source/TestFiles/testExcel.xlsx

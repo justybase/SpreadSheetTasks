@@ -55,7 +55,7 @@ dotnet add package SpreadSheetTasks
 ## Performance and NativeAOT
 
 See the dedicated [performance and NativeAOT guide](performance-and-aot.md)
-for the support matrix, publish smoke test and .NET 10 versus NativeAOT
+for the support matrix, publish smoke test and .NET 11 versus NativeAOT
 benchmark commands and results.
 
 ---

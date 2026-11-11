@@ -12,8 +12,8 @@ internal static class Program
         => BenchmarkSwitcher.FromAssembly(typeof(Program).Assembly).Run(args);
 }
 
-[SimpleJob(RuntimeMoniker.Net10_0, baseline: true, launchCount: 1, warmupCount: 1, iterationCount: 3)]
-[SimpleJob(RuntimeMoniker.NativeAot10_0, launchCount: 1, warmupCount: 1, iterationCount: 3)]
+[SimpleJob(RuntimeMoniker.Net11_0, baseline: true, launchCount: 1, warmupCount: 1, iterationCount: 3)]
+[SimpleJob(RuntimeMoniker.NativeAot11_0, launchCount: 1, warmupCount: 1, iterationCount: 3)]
 [MemoryDiagnoser]
 public class NativeAotReadWriteBenchmarks
 {
