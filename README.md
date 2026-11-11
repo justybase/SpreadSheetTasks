@@ -27,13 +27,13 @@ without requiring Microsoft Excel.
 ## Installation
 
 ```bash
-dotnet add package SpreadSheetTasks --version 2.1.0
+dotnet add package SpreadSheetTasks --version 2.2.0
 ```
 
 Or add the package reference manually:
 
 ```xml
-<PackageReference Include="SpreadSheetTasks" Version="2.1.0" />
+<PackageReference Include="SpreadSheetTasks" Version="2.2.0" />
 ```
 
 ## Quick start
@@ -251,6 +251,10 @@ Version 1.0.0 introduced the following corrected names:
 
 The old members remain available with `[Obsolete]` warnings where applicable.
 
+Version 2.2.0 adds a byte-level XLSX worksheet and shared-string scanner with an
+`XmlReader` fallback, precomputed XLSB date styles, faster XLSB UTF-16LE string
+decoding and NativeAOT smoke coverage. Existing public APIs are unchanged.
+
 Version 2.1.0 changes the default ZIP compression to zlib level 3 and makes the
 compression-level constructor parameters nullable (`null` = level 3). Pass
 `CompressionLevel.Optimal` explicitly to keep the previous level-6 file sizes.
@@ -258,7 +262,7 @@ compression-level constructor parameters nullable (`null` = level 3). Pass
 `ExcelReaderAbstract.CurrentRow` was added. Because the constructor signatures
 changed, recompile against 2.1.0 rather than mixing binaries from 2.0.x.
 
-Recent correctness fixes (unreleased):
+Also fixed in 2.2.0:
 
 - Inline strings containing an `_xHHHH_` sequence now round-trip: the XLSX writer
   emits the complete `_x005F_` escape instead of dropping the separating
