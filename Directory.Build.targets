@@ -1,0 +1,17 @@
+<Project>
+
+  <!--
+    Runtime Async (.NET 11): compile `async` methods against runtime
+    suspension points instead of compiler-generated state machines.
+    Enabled only when the project actually targets net11.0; the other
+    target frameworks in this repository are unaffected.
+
+    This lives in Directory.Build.targets, not Directory.Build.props,
+    because props are evaluated before the project sets TargetFramework
+    (the condition would always be false there).
+  -->
+  <PropertyGroup Condition="'$(TargetFramework)' == 'net11.0'">
+    <Features>$(Features);runtime-async=on</Features>
+  </PropertyGroup>
+
+</Project>
